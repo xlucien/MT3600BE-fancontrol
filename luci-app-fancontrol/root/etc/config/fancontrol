@@ -1,0 +1,51 @@
+config fancontrol 'main'
+	option enabled '1'
+
+	# 硬件路径留空时由守护进程自动探测（换机型不用改配置）
+	option temp_source ''
+	option pwm_control ''
+	option pwm_enable ''
+
+	# 采样间隔（秒）。守护进程按这个节拍读温度、写 PWM。
+	# 页面稳态刷新率跟随此值；「保存 → PWM 到位」期间自动提速到 250ms。
+	option interval '1'
+
+	# 控制模式：system（交还内核）/ auto（三档）/ auto_curve（线性曲线）/ manual（固定占空比）
+	option mode 'auto'
+
+	option manual_speed '128'
+
+	# auto 模式的三档阈值与对应占空比（0-255）
+	option auto_temp_low '50'
+	option auto_temp_mid '60'
+	option auto_temp_high '75'
+	option auto_pwm_low '50'
+	option auto_pwm_mid '128'
+	option auto_pwm_high '255'
+
+	# auto_curve 模式的线性插值端点（0-255）
+	option min_temp '40'
+	option max_temp '70'
+	option min_speed '50'
+	option max_speed '255'
+
+	# 历史记录保留条数
+	option history_size '60'
+
+	# 夜间模式：窗口内固定用 night_speed，支持跨天（如 23:00 -> 07:00）
+	option night_enabled '0'
+	option night_start '23:00'
+	option night_end '07:00'
+	option night_speed '0'
+
+	# 温度守护：升到 guard_temp 强制用 guard_speed，降到 guard_exit 才交还常规。
+	# guard_exit 必须低于 guard_temp；配置反序时守护进程会自动夹到 guard_temp-1，
+	# 避免温度落在 [guard_temp, guard_exit] 区间时退不出闭锁。
+	option guard_enabled '1'
+	option guard_temp '90'
+	option guard_exit '80'
+	option guard_speed '178'
+
+	# 渐入时长（秒）：改动后的「最长时间」。实际时长按改动幅度折算
+	# （改 10% 约用 1/8，改满档才用满）。设 0 关闭渐变。
+	option ramp_up '30'

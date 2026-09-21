@@ -1,0 +1,19 @@
+# 忽略临时与构建产物
+*.ipk
+*.apk
+build_dir/
+staging_dir/
+bin/
+tmp/
+.tmp/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# 本地验证脚本产物（这些是开发期用的，不属于发布内容）
+_pre-deploy.htm
+_loop-pre-guardfix.bak
