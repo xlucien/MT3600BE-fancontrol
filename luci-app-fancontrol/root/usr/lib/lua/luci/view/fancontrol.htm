@@ -3,7 +3,7 @@
 local uci = require "luci.model.uci".cursor()
 local defs = {mode="auto", manual_speed=128, auto_temp_low=50, auto_temp_mid=60, auto_temp_high=75,
               auto_pwm_low=50, auto_pwm_mid=128, auto_pwm_high=255,
-              min_temp=40, max_temp=70, min_speed=50, max_speed=255, interval=5,
+              min_temp=40, max_temp=70, min_speed=50, max_speed=255, interval=1,
               night_enabled=0, night_start="23:00", night_end="07:00", night_speed=0, ramp_up=30,
               guard_enabled=1, guard_temp=90, guard_exit=80, guard_speed=178}
 local jarr = {}
@@ -61,16 +61,41 @@ end
     #fc .st-mono { font-family:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace; font-size:12px;
                    color:#5b6b83; background:#f7f9fc; border:1px solid var(--line); border-radius:8px;
                    padding:6px 12px; margin-bottom:12px; white-space:nowrap; overflow-x:auto; }
-    /* 【修复1-栅格】原为 repeat(auto-fit,minmax(110px,1fr))。
-       实测这个组合在窄容器里会铺出大量 0px 幽灵列（最多见过 82 列，
-       列数在 79~82 之间漂移），导致格子宽度不稳。改成写死 4 列、
-       轨道下限 0，宽度就完全确定了。窄屏另用媒体查询降为 2 列。 */
+    /* 状态卡栅格：写死 4 列，不用 auto-fit。
+       这条链修过两轮，把两次的坑都记下来，别再踩第三次：
+
+       【第一轮】原来写 repeat(auto-fit, minmax(110px, 1fr))。
+         - minmax 的第一个参数 110px 只是「轨道下限」，不是上限。格子里一旦
+           有不换行的长文字（渐入提示「保存后 手动渐入 50% → 100%」自然宽
+           146.6px），内容的 min-content 就会把轨道顶开，进而把卡片和外层
+           栅格一起顶宽 → 用户看到「切渐入时页面宽度变了」。
+         - 同时栅格子项默认 min-width:auto，也允许内容反推轨道宽度。
+
+       【第二轮】当时把下限改成 0（minmax(0,1fr)），想当然以为「下限归零就
+       不会被顶宽」。实测证明这个更糟：auto-fit 在下限为 0 时会疯狂铺列 ——
+       900px 容器下算出了 82 个轨道，其中 78 个是塌缩成 0px 的「幽灵列」，
+       而它们的 gap 也照样参与布局。幽灵列数量对亚像素级变化极其敏感，
+       列数一抖整行就重排，反而让宽度更不稳定。实测数据：
+         minmax(0,1fr)   → 82 列（78 个 0px 幽灵列）
+         minmax(110px,1fr) →  7 列（ 3 个 0px 幽灵列）
+         repeat(4,minmax(0,1fr)) → 4 列，轨道干净
+
+       【现在的写法】状态卡就是固定 4 格，没有「自适应列数」的需求，
+       所以直接写死 repeat(4, minmax(0,1fr))：
+         - 列数恒定 → 不存在列数抖动，宽度天然稳定；
+         - 下限 0 保留 → 轨道严格等于「可用宽度 ÷ 4」，内容无权干预；
+         - 配合 .tile 的 min-width:0 与 .jp-t 的绝对定位，这条传导链彻底断开。
+
+       注意：若将来状态卡格子数变了，这里的 4 要跟着改。 */
     #fc .tiles { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+    /* 窄屏降为 2 列：4 列时每格只剩约 113px，「62.2 °C」勉强放得下，
+       但余量太小容易和单位挤在一起。降到 2 列每格约 340px，读数舒展。
+       这里同样写死列数（不用 auto-fit），理由见上面那段注释。 */
     @media (max-width:640px){ #fc .tiles { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-    /* 【修复2-高度】padding-bottom:25px 是给渐入提示文字预留的**常驻**空间。
-       原来 .tile 只有 padding:9px 12px，渐入时 .jp/.jp-t 作为流内元素
-       会把格子撑高，显隐之间来回跳。现在预留常驻、两个元素改绝对定位，
-       四个格子永远同高。position:relative 是给它们做定位基准。 */
+    /* padding-bottom:25px 是给渐入提示文字预留的**常驻**空间，四个格子永远同高。
+       早期版本只在渐入时由 JS 加 .has-jp 临时撑高，导致 PWM 格 63.5→88.5px、
+       整张状态卡 407.5→429.75px，下方内容整体下移 22px，渐入结束又缩回去。
+       改成常驻后，文字只是在预留空白里显隐，对布局零影响。 */
     #fc .tile { background:#f7f9fc; border:1px solid var(--line); border-radius:9px;
                 padding:9px 12px 25px; min-width:0; position:relative; }
     #fc .tile span { display:block; font-size:11px; color:var(--muted); }
@@ -78,18 +103,35 @@ end
     #fc .tile small { font-size:11px; color:var(--muted); font-weight:500; margin-left:2px; }
     /* PWM 格内的渐入进度条：实时显示「已到 x% ／ 目标 y%」的追赶进度 */
     #fc .tile.ramping { background:#fffbf4; border-color:#f3ddb0; }
-    /* 【修复2-高度】进度条与提示文字都改绝对定位，放进 .tile 底部预留带。
-       预留带自下而上（内容区底线为 0）：
+    /* 渐入进度条：同样绝对定位，放进 .tile 底部预留的带里。
+       它以前是流内元素（margin-top:6px + height:3px = 9px），
+       display:none ↔ 显示之间会让 PWM 格高度跳 9px —— 这是高度抖动的最后一环。
+       绝对定位后，进度条与提示文字共用同一条预留带，显隐都不影响高度。
+
+       预留带的自下而上布局（.tile padding-bottom:25px，内容区底线为 0）：
          bottom 8    文字行（line-height 13）→ 占 8..21
          bottom 22   进度条（height 3）      → 占 22..25
-       两者留 1px 间隙，互不重叠。显隐都不再影响格子高度。 */
+       两者留 1px 间隙，互不重叠。 */
     #fc .jp { position:absolute; left:12px; right:12px; bottom:22px;
               height:3px; border-radius:2px; background:#e8ecf3; overflow:hidden; }
     #fc .jp > i { display:block; height:100%; width:0; border-radius:2px;
                   background:linear-gradient(90deg,#f0a83c,#ef7f2c);
                   transition:width .5s linear; }
-    /* 提示文字同样绝对定位：宽度不再是布局因素，多长都不撑宽格子；
-       超长时省略号收尾，既不溢出到相邻格，也不挤压上面的 PWM 数值。 */
+    /* 渐入提示文字：绝对定位，完全不参与横向宽度计算。
+       原先是普通流内元素 + white-space:nowrap，文字一长就把 PWM 格顶宽，
+       连带整张状态卡和页面栅格一起变宽（用户看到的就是「页面宽度会变」）。
+       改成绝对定位后：
+         - 宽度不再是布局因素，多长都不影响卡片尺寸；
+         - 文字被限制在格子宽度内并居中，超长时以省略号收尾（ellipsis），
+           既不会溢出到相邻格子，也不会挤压上面的 PWM 数值。
+
+       【关键】预留空间必须**常驻**，不能只在渐入时才加。
+       曾经写成 .tile.has-jp{padding-bottom:25px} 由 JS 在渐入开始时添加，
+       后果是渐入期间 PWM 格从 63.5px 长到 88.5px、整张状态卡从 407.5px
+       长到 429.75px，下方保存栏以下所有内容整体下移 22px，
+       渐入结束又缩回去 —— 用户看到的就是「高度还是会变化」。
+       现在把 padding-bottom 直接写在 .tile 本体上（见上面 .tile 规则），
+       四个状态格永远同高，渐入文字只是「在被预留的空白里显隐」，对布局零影响。 */
     #fc .jp-t { position:absolute; left:12px; right:12px; bottom:8px;
                 font-size:10.5px; line-height:13px; color:var(--warn);
                 white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
@@ -108,10 +150,13 @@ end
     #fc .dot.r { background:var(--hot); box-shadow:0 0 0 3px #fdecec; }
     #fc .svc-row .r { font-size:12px; color:var(--muted); }
 
-    #fc .seg { display:inline-flex; background:#f1f4f9; border-radius:9px; padding:3px; gap:2px; flex-wrap:wrap; }
-    #fc .seg button { border:0; background:transparent; padding:7px 16px; border-radius:7px;
-                      font-size:13px; font-weight:600; color:var(--muted); cursor:pointer; transition:all .15s; }
-    #fc .seg button.active { background:var(--brand); color:#fff; }
+    /* 分段控件：浅灰凹槽，选中项 = 白色浮起小块（不是蓝色实心） */
+    #fc .seg { display:inline-flex; background:#f2f4f8; border-radius:10px; padding:3px; gap:2px; flex-wrap:wrap; }
+    #fc .seg button { border:0; background:transparent; padding:7px 18px; border-radius:8px;
+                      font-size:13px; font-weight:600; color:#7c8698; cursor:pointer; transition:all .15s; }
+    #fc .seg button:hover:not(.active) { color:var(--text); }
+    #fc .seg button.active { background:#fff; color:var(--text); box-shadow:0 1px 3px rgba(16,24,40,.1),
+                            0 0 0 .5px rgba(16,24,40,.04); }
 
     #fc .panel { display:none; }
     #fc .panel.show { display:block; }
@@ -120,35 +165,39 @@ end
     #fc .row:last-child { border-bottom:0; }
     #fc .lb { font-size:13.5px; font-weight:600; }
     #fc .sub { font-size:11.5px; color:var(--muted); margin-top:2px; }
-    /* 步进器：一体式胶囊。按钮自身做成圆角，避免方形底色从胶囊边角露出 */
-    #fc .step { display:inline-flex; align-items:center; flex:none;
-                border:1px solid var(--line); border-radius:999px;
-                background:#fff; overflow:hidden;
-                box-shadow:0 1px 2px rgba(16,30,54,.04); }
+    /* 步进器：减号 / 数值 / 加号 三段并排。
+       曾经给三段各加 1px 边框，但浅色底上那圈线看着像「黑框」太重，
+       改成**不用描边**、以浅灰底 + 白底区分层次 —— 结构照样看得清，视觉更轻。
+
+       圆角取值：三者统一 8px，与 .chip / .seg button 同值（页面「小号控件」基准）。 */
+    #fc .step { display:inline-flex; align-items:center; flex:none; gap:6px; }
+    /* 减/加按钮：浅灰底，无描边 */
     #fc .step button { width:29px; height:29px; flex:none;
-                       border:0; border-radius:50%; margin:0 1px;
-                       background:transparent;
+                       border:0; border-radius:8px;
+                       background:#f2f4f8;
                        font-size:15px; line-height:1; cursor:pointer; color:#8792a4;
                        display:flex; align-items:center; justify-content:center;
                        transition:background .14s, color .14s; }
-    #fc .step button:hover { background:#e8f0fe; color:var(--brand); }
-    #fc .step button:active { background:#d8e6fd; }
-    /* 中间的数值区：无左右分隔线，改用一条极浅的分隔更干净 */
+    #fc .step button:hover { background:#e6edfb; color:var(--brand); }
+    #fc .step button:active { background:#d8e5fa; }
+    /* 数值框：白底 + 极浅投影，与灰底按钮形成层次（不用描边） */
     #fc .step .vwrap { display:flex; align-items:center; justify-content:center;
-                       height:29px; padding:0 8px 0 2px; gap:1px; }
-    #fc .step .vwrap::before,
-    #fc .step .vwrap::after { content:''; width:1px; height:15px; background:var(--line); flex:none; }
-    #fc .step .vwrap::before { margin-right:7px; }
-    #fc .step .vwrap::after  { margin-left:7px; }
+                       height:29px; padding:0 8px 0 2px; gap:1px;
+                       border:0; border-radius:8px;
+                       background:#fff;
+                       box-shadow:0 1px 2px rgba(16,24,40,.06); }
     #fc .step input.v { width:38px; border:0; outline:0; background:transparent; text-align:right;
                         font-size:13.5px; font-weight:650; color:var(--text);
                         font-variant-numeric:tabular-nums; padding:0; }
     #fc .step input.v::-webkit-outer-spin-button,
     #fc .step input.v::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
     #fc .step input.v[type=number] { -moz-appearance:textfield; }
-    #fc .step input.v:focus { background:#eef4fe; border-radius:4px; }
+    /* 聚焦 / 报错都作用在「数值框」这层（它是白底那块）。
+       聚焦用柔和光晕而非硬边线，报错才用浅红底提示。 */
+    #fc .step .vwrap:focus-within { background:#f5f9ff; box-shadow:0 0 0 3px #e5eeff; }
+    #fc .step .vwrap.is-err { background:#fdecec; box-shadow:none; }
     #fc .step .u { font-size:12px; color:var(--muted); white-space:nowrap; }
-    #fc .step input.v.err { color:var(--hot); background:#fdecec; border-radius:4px; }
+    #fc .step input.v.err { color:var(--hot); }
     #fc .hint { font-size:12px; color:var(--muted); margin-top:10px; }
 
     #fc .mp-num { font-size:34px; font-weight:700; color:var(--brand); font-variant-numeric:tabular-nums;
@@ -159,26 +208,60 @@ end
     #fc .mp-num::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
     #fc .mp-num[type=number] { -moz-appearance:textfield; }
     #fc .mp-cap { font-size:12px; color:var(--muted); margin-top:6px; }
+    /* 【手动 PWM 并排布局】数值输入与滑条左右并排，替代原来的「数值在上、滑条在下」。
+       用 grid 而非 flex，是为了让「数字／%」与「滑条」两列有稳定宽度，
+       不会因数字位数变化（0 ↔ 100）导致滑条左右抖动。
+       - 第一列固定宽 104px（34px 字号下 3 位数 + 百分号刚好放得下）
+       - 第二列 minmax(0,1fr) 吃掉剩余宽度并允许收缩（防溢出）
+       - align-items:center 让数字基线与滑条中线对齐 */
+    #fc .mp-line { display:grid; grid-template-columns:104px minmax(0,1fr);
+                   align-items:center; gap:14px; }
+    #fc .mp-line .mp-val { display:flex; align-items:baseline; justify-content:flex-end; }
+    #fc .mp-line .mp-unit { color:var(--muted); font-size:13px; margin-left:2px; }
+    /* 滑条基础样式：轨道 + 已填充部分用渐变表现（--fill 由 JS 写）。
+       并排后垂直外边距归零，改由 .mp-line 的 align-items 居中。 */
     #fc input[type=range] { -webkit-appearance:none; appearance:none; width:100%; height:6px;
-                            border-radius:999px; outline:0; margin:14px 0 6px;
+                            border-radius:999px; outline:0; margin:0;
                             background:linear-gradient(90deg,var(--brand) var(--fill,50%),#e3e9f2 var(--fill,50%)); }
     #fc input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; appearance:none; width:18px; height:18px;
                             border-radius:50%; background:#fff; border:2px solid var(--brand); cursor:pointer;
                             box-shadow:0 2px 6px rgba(16,24,40,.2); }
     #fc input[type=range]::-moz-range-thumb { width:16px; height:16px; border-radius:50%; background:#fff;
                             border:2px solid var(--brand); cursor:pointer; }
-    #fc .chips { display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
-    #fc .chip { border:1px solid var(--line); background:#fff; border-radius:999px; padding:5px 12px;
-                font-size:12px; font-weight:600; color:var(--text); cursor:pointer; transition:all .15s; }
-    #fc .chip:hover { border-color:var(--brand); color:var(--brand); }
-    #fc .chip.danger { background:var(--hot); border-color:var(--hot); color:#fff; }
-    #fc .chip.danger:hover { background:#d93b3b; border-color:#d93b3b; color:#fff; }
+    /* 档位胶囊：放进一条浅灰凹槽里，与分段控件 / 时间输入同一套「槽 + 白块」语言。
+       五个按钮等宽平分，不再用 flex-wrap 参差换行。
+       标签拆成「档名 + 百分比」两行——"超静音 20%" 这种长短不一的写法
+       会让等宽格子里的按钮宽窄失衡。做成上档名下数值后，五个格子完全对齐。 */
+    #fc .chips { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr));
+                 gap:4px; margin-top:12px; padding:3px;
+                 background:#f2f4f8; border-radius:11px; }
+    #fc .chip { display:flex; flex-direction:column; align-items:center; gap:1px;
+                border:1px solid transparent; background:transparent; border-radius:8px;
+                padding:7px 4px; font-size:12.5px; font-weight:600; color:var(--text);
+                cursor:pointer; transition:all .15s; line-height:1.25; }
+    #fc .chip b { font-weight:600; }
+    #fc .chip em { font-style:normal; font-size:11.5px; color:var(--muted); font-weight:600;
+                   font-variant-numeric:tabular-nums; }
+    /* 悬停：白块浮起，与分段控件选中态一致 */
+    #fc .chip:hover { background:#fff; color:var(--text);
+                      box-shadow:0 1px 3px rgba(16,24,40,.1), 0 0 0 .5px rgba(16,24,40,.04); }
+    #fc .chip:active { background:#eef2f8; box-shadow:none; }
+    /* 停转：全页唯一的危险操作，用红实心标出来 */
+    #fc .chip.danger { background:#e8453c; border-color:#e8453c; color:#fff;
+                       box-shadow:0 1px 3px rgba(232,69,60,.3), 0 3px 10px rgba(232,69,60,.2); }
+    #fc .chip.danger em { color:rgba(255,255,255,.82); }
+    #fc .chip.danger:hover { background:#d93b32; border-color:#d93b32; color:#fff;
+                             box-shadow:0 2px 6px rgba(232,69,60,.36), 0 5px 14px rgba(232,69,60,.24); }
 
     #fc canvas { width:100%; height:220px; display:block; }
     #fc .legend { display:flex; gap:16px; font-size:12px; color:var(--muted); margin-top:8px; }
-    #fc .legend i { display:inline-block; width:14px; height:3px; border-radius:2px; vertical-align:middle; margin-right:5px; }
-    #fc .legend i.lg-t { background:#ef4444; }
-    #fc .legend i.lg-p { background:#2563eb; height:4px; box-shadow:0 0 0 2px rgba(37,99,235,.18); }
+    /* 图例：温度实线；PWM 是虚线，图例也画成虚线（图例即所见） */
+    #fc .legend i { display:inline-block; width:16px; height:0; vertical-align:middle; margin-right:6px;
+                    border-top-width:2.5px; border-top-style:solid; }
+    #fc .legend i.lg-t { border-top-color:#ef4444; }
+    #fc .legend i.lg-p { border-top-color:#2563eb; border-top-style:dashed;
+                         border-top-width:2.5px;
+                         box-shadow:0 0 0 2px rgba(37,99,235,.16); }
 
     /* 合并进状态卡的历史曲线分区 */
     #fc .st-hist { margin-top:12px; border-top:1px dashed var(--line); padding-top:10px; }
@@ -199,8 +282,13 @@ end
                        background:#fff; border-radius:50%; transition:transform .2s; box-shadow:0 1px 3px rgba(16,24,40,.2); }
     #fc .sw input:checked + .sw-i { background:var(--brand); }
     #fc .sw input:checked + .sw-i:before { transform:translateX(20px); }
-    #fc input[type=time] { border:1px solid var(--line); border-radius:8px; padding:5px 8px;
-                           font-size:13.5px; font-weight:650; color:var(--text); background:#fff; }
+    /* 时间输入：去掉硬边框，改浅灰底，整体轻一点 */
+    #fc input[type=time] { border:1px solid transparent; border-radius:9px; padding:6px 8px;
+                           font-family:inherit; font-size:13.5px; font-weight:600; color:var(--text);
+                           background:#f2f4f8; outline:0; transition:all .15s; }
+    #fc input[type=time]:hover { background:#eceff5; }
+    #fc input[type=time]:focus { background:#fff; border-color:var(--brand);
+                                 box-shadow:0 0 0 3px rgba(46,123,240,.14); }
     #fc .timepair { display:flex; align-items:center; gap:6px; }
     #fc .timepair .sep { color:var(--muted); }
     #fc .sep-line { height:1px; background:var(--line); margin:14px 0; }
@@ -217,14 +305,19 @@ end
                    padding:12px 18px; flex-wrap:wrap; }
     #fc .sb-left { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
     #fc .sb-right { display:flex; gap:8px; }
-    #fc .btn { border:1px solid var(--line); background:#fff; border-radius:8px; padding:8px 18px;
-               font-family:inherit; font-size:13px; font-weight:650; color:var(--text);
-               cursor:pointer; transition:all .15s; }
-    #fc .btn:hover { border-color:var(--brand); color:var(--brand); }
-    #fc .btn.primary { background:var(--brand); border-color:var(--brand); color:#fff; }
-    #fc .btn.primary:hover { background:#2569d6; color:#fff; }
-    #fc .btn.primary.dirty { background:var(--warn); border-color:var(--warn); }
-    #fc .btn.primary.dirty:hover { background:#d98806; color:#fff; }
+    /* 按钮：更圆（10px）、边框更淡、有细阴影，整体更轻 */
+    #fc .btn { border:1px solid #e6eaf1; background:#fff; border-radius:10px; padding:8px 20px;
+               font-family:inherit; font-size:13px; font-weight:600; color:var(--text);
+               cursor:pointer; transition:all .15s;
+               box-shadow:0 1px 2px rgba(16,24,40,.05); }
+    #fc .btn:hover { border-color:#d3dae5; background:#fcfdff; }
+    #fc .btn:active { background:#f4f6fa; }
+    #fc .btn.primary { background:var(--brand); border-color:var(--brand); color:#fff;
+                       box-shadow:0 1px 3px rgba(46,123,240,.28), 0 4px 12px rgba(46,123,240,.18); }
+    #fc .btn.primary:hover { background:#2b73e4; border-color:#2b73e4; color:#fff; }
+    #fc .btn.primary.dirty { background:var(--warn); border-color:var(--warn);
+                             box-shadow:0 1px 3px rgba(245,158,11,.28), 0 4px 12px rgba(245,158,11,.18); }
+    #fc .btn.primary.dirty:hover { background:#e08f08; border-color:#e08f08; color:#fff; }
     #fc .pill.dirty { background:#fdf1dc; color:var(--warn); }
 </style>
 
@@ -318,7 +411,7 @@ end
             <div id="panel-auto" class="panel"></div>
             <div id="panel-curve" class="panel"></div>
             <div id="panel-manual" class="panel">
-                <div class="hint">手动占空比在右侧「手动 PWM」卡片中调节，0% 为停转。参数修改即时保存，守护进程 5 秒内应用。</div>
+                <div class="hint">手动占空比在右侧「手动 PWM」卡片中调节，0% 为停转。参数修改即时保存，守护进程按固件采样间隔应用。</div>
             </div>
         </div>
 
@@ -337,26 +430,29 @@ end
             </div>
             <div id="rows-night"></div>
             <div class="hint" id="nightHint"></div>
-            <div class="hint" style="margin-top:4px">转速渐入：转速上升时按此秒数平滑爬升，避免夜间结束后风扇突然全速。设 0 关闭渐变。</div>
+            <div class="hint" style="margin-top:4px">转速渐入：改动后的<b>最长时间</b>。实际时长按改动幅度折算
+                （改 10% 约用 1/8 时长，改满档才用满），所以小改动一两秒到位，不会每次都磨满。设 0 关闭渐变。</div>
         </div>
     </div>
 
     <div>
         <div class="card">
             <div class="card-h"><div class="card-t">手动 PWM</div></div>
-            <div style="text-align:right">
-                <input class="mp-num" id="mpVal" type="number" inputmode="decimal" min="0" max="100" step="1" value="0">
-                <small style="color:var(--muted)"> %</small>
+            <div class="mp-line">
+                <div class="mp-val">
+                    <input class="mp-num" id="mpVal" type="number" inputmode="decimal" min="0" max="100" step="1" value="0">
+                    <span class="mp-unit">%</span>
+                </div>
+                <input type="range" id="mpSlider" min="0" max="100" step="1" value="50"
+                       oninput="onSlide(this.value)" onchange="onSlideCommit()">
             </div>
-            <input type="range" id="mpSlider" min="0" max="100" step="1" value="50"
-                   oninput="onSlide(this.value)" onchange="onSlideCommit()">
             <div class="mp-cap">0% 关闭风扇，1% - 100% 直接设置 PWM。可直接输入百分比，或拖动滑条。</div>
             <div class="chips">
-                <button class="chip danger" onclick="quickPwm(0)">停转 0%</button>
-                <button class="chip" onclick="quickPwm(20)">超静音 20%</button>
-                <button class="chip" onclick="quickPwm(30)">静音 30%</button>
-                <button class="chip" onclick="quickPwm(50)">中速 50%</button>
-                <button class="chip" onclick="quickPwm(100)">全速 100%</button>
+                <button class="chip danger" onclick="quickPwm(0)"><b>停转</b><em>0%</em></button>
+                <button class="chip" onclick="quickPwm(20)"><b>超静音</b><em>20%</em></button>
+                <button class="chip" onclick="quickPwm(30)"><b>静音</b><em>30%</em></button>
+                <button class="chip" onclick="quickPwm(50)"><b>中速</b><em>50%</em></button>
+                <button class="chip" onclick="quickPwm(100)"><b>全速</b><em>100%</em></button>
             </div>
         </div>
 
@@ -380,18 +476,46 @@ end
 var INIT = { <%= table.concat(jarr, ",") %> };
 var dataUrl = '<%= url("admin/system/fancontrol/data") %>';
 var saveUrl = '<%= url("admin/system/fancontrol/save") %>';
-// 【修复4-刷新率】原来硬钳 3 秒：Math.max(3, INIT.interval || 5) * 1000，
-// 于是「点保存 → 风扇转到目标」这段几秒的渐入，只能每 3 秒才刷新一次，
-// 进度条一顿一顿地跳。改成两级：
-//   慢档（稳态）= 固件 interval（默认 1 秒），够用且省；
-//   快档（保存 → PWM 真正到位）= 250ms，把渐入过程画连贯。
-// 250ms 而非更激进：uhttpd 是单进程，请求打太密会挤占其他页面。
+// 【两级刷新率】慢档完全跟随固件的 interval 配置，不再硬钳下限。
+// 这里曾经写 Math.max(3, ...)，把间隔钳到最低 3 秒，结果即使固件 interval
+// 配成 1 秒，页面依然 3 秒才更新一次，渐入只剩一两帧。
+// 现在直接采信 uci 的值，固件配几秒就是几秒。
+//
+// 慢档（稳态）：SLOW_MS = interval 秒，默认 1 秒。
+//   温度、转速这类读数一秒一跳完全够看；稳态下风扇基本不动，没必要打高频请求。
+//   这是常态档位，占 99% 的时间，必须省。
+//
+// 快档（点击保存 → PWM 真正到位）：FAST_MS = 250ms。
+//   只有这短短几秒需要把进度条、剩余秒数、PWM 数字画连贯，一到位立刻降回慢档。
+//   注意这是**页面拉数据的频率**，与守护进程写 PWM 的整数秒节拍无关 ——
+//   进度条按服务端快照插值绘制，所以即使 PWM 一秒才跳一档，
+//   进度条本身仍是 250ms 一帧的顺滑动画。
+//
+// 兜底：interval 若被配成 0 或非数字，退到 1 秒，避免 0 导致请求风暴。
 var SLOW_MS = Math.max(1, parseInt(INIT.interval, 10) || 1) * 1000;
 var FAST_MS = 250;
 var refreshMs = SLOW_MS;      // 兼容旧引用，实际节拍由 pollTimer 控制
 var pollMsNow = SLOW_MS;      // 当前生效的节拍，用来判断是否需要重排定时器
 var pollTimer = null;
-var fastUntil = 0;            // 提速窗口的时间戳兜底（见 syncPollRate）
+
+// 【提速窗口】只在「保存 → PWM 真正到位」这段时间提速，其余时间一律走 SLOW_MS。
+//
+// 曾经用「实际 pwm 与目标不等」来做判据，但那个目标取自 history 最后一行，
+// history 里只要残留一条旧目标（上次改动的），稳态下它就永远不等于 pwm →
+// 快档永不退出，页面变成一直打高频请求。改成只认服务端快照的 ramp_active：
+// 守护进程自己最清楚这段渐入在不在进行、有没有到位，页面不需要二次推断。
+//
+// fastUntil 覆盖「点保存 → 服务端第一拍快照回来」之间的空窗：守护进程节拍是
+// 整数秒，而点下保存到它下一轮落盘最多要等 SLOW_MS，这段空窗里 ramp_active
+// 还是上一轮的 0，得靠保存时间戳兜住，否则提速要晚一拍才生效。
+var fastUntil = 0;
+
+// 服务端快照里的渐入目标 raw 值（0-255），仅用于界面文案，不参与提速判据。
+var rampTargetRaw = null;
+
+// 渐入进度：完全采信服务端 /tmp/fancontrol_ramp 的快照（起止时刻 + 总时长），
+// 不再靠「本次采样 pwm 减上次采样 pwm」去反推——轮询间隔一旦大于 1 秒，反推必失真。
+var rampInfo = null;
 
 var CFG = Object.assign({}, INIT);
 var SAVED = Object.assign({}, INIT);
@@ -402,9 +526,15 @@ var lastClock = '';
 // 本次渐入的起点 raw 值：进入渐入时记录，用于算进度条百分比；渐入结束后清空
 var rampFrom = null;
 var wasRamping = false;
-// 服务端快照里的目标 raw 值（ramp_to）：用于判断「是否还需高频轮询」。
-// 只要实际 pwm 还没追到它，就保持快档；ramp_active 归 0 但 pwm 还差最后一格时也不降档。
-var rampTargetRaw = null;
+// 温度→PWM 曲线的增量重绘状态（见 drawCurve）：
+//   curveSig      上一次绘制曲线时的参数签名，变了才重建 SVG
+//   curveGeom     重建时存下的坐标换算函数，供动态层算标记位置
+//   curveMarkEl   缓存的 <g id="curveMark"> 节点
+//   curveMarkKey  上一次画标记时的温度（放大 10 倍取整），相同就跳过
+var curveSig = null;
+var curveGeom = null;
+var curveMarkEl = null;
+var curveMarkKey = null;
 
 /* ---------- 工具 ---------- */
 function $(id){ return document.getElementById(id); }
@@ -445,11 +575,11 @@ var ROWS = {
     ],
     night: [
         {k:'night_speed', lb:'夜间转速', sub:'0% 停转，建议 20~30%', pct:1, step:5, lo:0, hi:50},
-        {k:'ramp_up',     lb:'渐入时长', sub:'转速平滑爬升秒数', unit:' 秒', step:5, lo:0, hi:120}
+        {k:'ramp_up',     lb:'渐入时长', sub:'改动后变化的最长时间', unit:' 秒', step:5, lo:0, hi:120}
     ],
     guard: [
         {k:'guard_temp',  lb:'守护温度', sub:'升到此处强制散热', unit:' ℃', step:1, lo:30, hi:120},
-        {k:'guard_exit',  lb:'退出温度', sub:'降到此处交还常规（需低于守护温度）', unit:' ℃', step:1, lo:20, hi:120},
+        {k:'guard_exit',  lb:'退出温度', sub:'降到此处交还常规；必须低于守护温度，否则会被自动下调到「守护温度 − 1」', unit:' ℃', step:1, lo:20, hi:120},
         {k:'guard_speed', lb:'守护转速', sub:'守护期间的强制占空比', pct:1, step:5, lo:0, hi:100}
     ]
 };
@@ -488,19 +618,27 @@ function syncRow(k){
     var el = $('v-' + k);
     if(el){
         el.value = dispVal(r);
-        el.classList.remove('err');
+        setErrState(el, false);
     }
+}
+
+/* 把 input 的 err 状态同步到外层 .vwrap（边框画在外层，只改 input 看不出效果） */
+function setErrState(el, on){
+    if(!el) return;
+    el.classList.toggle('err', !!on);
+    var w = el.closest ? el.closest('.vwrap') : null;
+    if(w) w.classList.toggle('is-err', !!on);
 }
 
 /* 跨字段合理性校验：退出温度必须低于守护温度，否则守护一触发就立刻退出 */
 function checkGuardOrder(){
     var t = parseInt(CFG.guard_temp, 10), e = parseInt(CFG.guard_exit, 10);
     var et = $('v-guard_exit'), tt = $('v-guard_temp');
-    if(et) et.classList.remove('err');
-    if(tt) tt.classList.remove('err');
+    setErrState(et, false);
+    setErrState(tt, false);
     if(isNaN(t) || isNaN(e)) return true;
     if(e >= t){
-        if(et) et.classList.add('err');
+        setErrState(et, true);
         return false;
     }
     return true;
@@ -559,7 +697,7 @@ document.getElementById('fc').addEventListener('click', function(e){
 /* 数值输入框：回车提交、失焦提交、聚焦全选；上下方向键走原生步进 */
 document.getElementById('fc').addEventListener('input', function(e){
     if(e.target.classList && e.target.classList.contains('v')){
-        e.target.classList.remove('err');
+        setErrState(e.target, false);
     }
     if(e.target.id === 'mpVal'){
         onPwmInput();
@@ -713,16 +851,17 @@ function previewPending(dirty){
     var pT = $('pT'), jpBar = $('jpBar'), jpFill = $('jpFill'), jpText = $('jpText');
     if(!pT || !jpBar) return;
 
-    // 【修复3-早退残留】先无条件清掉渐入外观，再由下面分支决定是否重新点亮。
-    // 这一步必须在所有早退之前执行 —— 否则「改一下再放弃修改」时，
-    // 进度条会一直留在格子里（原实现在 !dirty 时直接 return，就是这个问题）。
+    // 先无条件清掉渐入外观，再由下面的分支决定是否重新点亮。
+    // 这一步必须在早退（!dirty / 模式不适用 / 目标与当前相同）之前执行，
+    // 否则「改一下再放弃修改」时进度条会一直留在格子里。
+    // 注意：底部预留空间已改为 .tile 常驻（见 CSS），这里不再需要管 has-jp。
     function clearJp(){
         pT.classList.remove('ramping');
         if(jpBar) jpBar.style.display = 'none';
         if(jpText) jpText.style.display = 'none';
     }
 
-    if(!dirty || CFG.mode === 'system'){ clearJp(); return; }    // 没改动 / 系统模式：交给 updateStatus
+    if(!dirty || CFG.mode === 'system'){ clearJp(); return; }  // 没改动 / 系统模式：交给 updateStatus
 
     // 按当前模式算出保存后的目标 PWM（百分比）
     var target = null, label = '';
@@ -819,20 +958,22 @@ function doSave(){
                     toast('部分参数未写入：' + j.failed);
                     $('saveState').textContent = '部分写入失败 · ' + new Date().toLocaleTimeString();
                 } else if(j.warn === 'guard_exit>=guard_temp'){
-                    toast('已保存，但退出温度不低于守护温度，守护不会生效');
-                    $('saveState').textContent = '已保存（守护双阈值顺序有误）· ' + new Date().toLocaleTimeString();
+                    // 守护进程会把它夹到「守护温度 − 1」以保证能退出闭锁，
+                    // 所以功能不会失效，只是回差被压成 1 ℃。说明清楚即可，不必阻止保存。
+                    toast('退出温度不低于守护温度，已按「守护温度 − 1」生效');
+                    $('saveState').textContent = '已保存（退出温度已自动下调为守护温度 − 1）· ' + new Date().toLocaleTimeString();
                 } else {
                     toast('已保存并立即生效');
                     $('saveState').textContent = '已保存并生效 · ' + new Date().toLocaleTimeString();
                 }
-                setTimeout(function(){ fetchData(true); }, 1200);
-                // 【修复4-刷新率】点下保存就立刻切快档，不等下一次轮询才发现渐入。
-                // fastUntil 兜住「保存 → 服务端第一拍快照回来」之间的空窗：
-                // 守护进程节拍是整数秒，这段空窗里 ramp_active 还是 0，
-                // 没有 fastUntil 就会先按慢档走一拍，进度条起步晚。
-                // 给足 SLOW_MS × 2 + 2 秒：够守护进程走完「被唤醒 → 应用新值 → 落盘」。
+                // 【提速窗口起点】服务端读盘后到守护进程下一次落盘之间有延迟，
+                // 这段空窗里 ramp_active 还是 0，靠时间戳把提速提前打开。
+                // 给足 SLOW_MS × 2 + 2 秒：够守护进程走完「被唤醒 → 应用新值 →
+                // 开始渐入 → 落盘 ramp_active=1」；一旦它落盘了，下面的
+                // inFastWindow 就改由 ramp_active 接管，时间戳自然失效。
                 fastUntil = Date.now() + SLOW_MS * 2 + 2000;
-                syncPollRate(true);
+                syncPollRate(true);   // 立刻切快档，不等下一次轮询才发现
+                setTimeout(function(){ fetchData(true); }, 1200);
             } else {
                 toast('保存失败：' + (j && j.status ? j.status : '返回非 JSON'));
                 $('saveState').textContent = '保存失败 · ' + new Date().toLocaleTimeString();
@@ -846,8 +987,36 @@ function doSave(){
 }
 
 /* ---------- 数据拉取与状态刷新 ---------- */
-// 【修复4-刷新率】返回 promise，供 pollTick 链式调度等它回来再排下一拍。
+
+/*
+ * 轮询节拍：慢档 ↔ 快档自动切换。
+ *
+ * 用「每次请求回来后再排下一次」的链式 setTimeout，而不是 setInterval：
+ *   - setInterval 在请求变慢时会堆积，且改节拍必须 clearInterval 重建；
+ *   - 链式调度天然保证「上一次回来才发下一次」，网络抖动时不会雪崩。
+ * 节拍变化时才重建定时器；节拍未变则继续沿用，避免每轮都 clearTimeout/重建。
+ */
+function syncPollRate(fast){
+    var want = fast ? FAST_MS : SLOW_MS;
+    if(want === pollMsNow && pollTimer) return;
+    pollMsNow = want;
+    if(pollTimer){ clearTimeout(pollTimer); pollTimer = null; }
+    pollTimer = setTimeout(pollTick, pollMsNow);
+}
+function pollTick(){
+    pollTimer = null;
+    var p = fetchData();
+    // 请求结束后再排下一拍；fetchData 出错也要继续，不能停摆
+    if(p && typeof p.then === 'function'){
+        p.then(function(){ if(!pollTimer) pollTimer = setTimeout(pollTick, pollMsNow); },
+               function(){ if(!pollTimer) pollTimer = setTimeout(pollTick, pollMsNow); });
+    } else {
+        pollTimer = setTimeout(pollTick, pollMsNow);
+    }
+}
+
 function fetchData(reloadCfg){
+    // 返回 Promise 供链式轮询（pollTick）在请求结束后再排下一拍
     return fetch(dataUrl, { cache:'no-store' })
         .then(function(resp){ return resp.json(); })
         .then(function(j){
@@ -894,13 +1063,25 @@ function updateStatus(now, svc){
     var tgtPct = tgtRaw === null ? null : raw2pct(tgtRaw);
     var ramping = tgtPct !== null && tgtRaw !== pwm;
 
-    // 【修复4-刷新率】提速窗口判据：三者取或，各管一段 ——
-    //   ramping               本地推算，覆盖温度波动触发的自动渐入
-    //   pwm !== rampTargetRaw 服务端 ramp_to，补「ramp_active 归 0 但 pwm 还差最后一格」的尾巴
-    //   fastUntil > now       兜住「点保存 → 第一拍快照回来」之间的空窗
-    // 只认服务端 ramp_active 会让渐入末尾提前降档，进度条尾部变成 1 秒一格地跳。
-    // 【顺序】rampTargetRaw 必须在这之前赋值，否则读到的还是上一轮的旧值。
+    // 服务端快照里的目标值：用于「是否还需高频轮询」——只要实际 pwm 还没追到它，
+    // 就保持快档；ramp_active 已经归 0 但 pwm 还差最后一格时也不会提前降档。
+    //
+    // 【必须在下面 syncPollRate 之前赋值】否则读到的还是上一轮的旧值，
+    // 提速窗口会晚一拍开始、晚一拍结束 —— 这正是最初改动时踩过的坑。
     rampTargetRaw = (now.ramp_to !== undefined && now.ramp_to !== null) ? +now.ramp_to : null;
+
+    // 【提速窗口】判据恢复为「本地推算的渐入状态 + 服务端目标值」，
+    // 而不是只看服务端的 ramp_active。
+    //
+    // 为什么改回来：只看 ramp_active 会在**渐入末尾**提前降档 ——
+    // 守护进程把 ramp_active 归 0 的时刻，实际 pwm 往往还差最后一格没追上。
+    // 一旦降到 SLOW_MS(1 秒)，进度条尾部就只能按 1 秒一格地跳，
+    // 前面还在 250ms 平滑走、最后一段突然变得一顿一顿，观感就是「动画变差了」。
+    //
+    // rampTargetRaw 取自服务端快照的 ramp_to：只要 pwm 还没追到它就一直保持快档，
+    // 正好补上这段尾巴。ramping 是本地用 history 末行推算的，覆盖温度波动
+    // 触发的自动渐入；fastUntil 兜住「点保存 → 第一拍快照回来」之间的空窗。
+    // 三者取或，谁先触发都能及时提速，且不会提前掉档。
     syncPollRate(ramping || (rampTargetRaw !== null && pwm !== rampTargetRaw) || fastUntil > Date.now());
 
     $('tTile').textContent = temp.toFixed(1);
@@ -914,13 +1095,16 @@ function updateStatus(now, svc){
     $('updAt').textContent = '更新于 ' + new Date().toLocaleTimeString();
 
     // 渐入进度提示（状态卡右上角的小胶囊）。
-    // 【只在手动模式显示】自动挡位/自动曲线下转速随温度自行调整，
-    // 温度一波动就触发小渐入，胶囊会反复闪；只有手动模式是「用户点了保存等结果」。
-    // 且只在文案真的变了才写 innerHTML —— 每帧无脑赋值会让浏览器反复解析 HTML。
+    // 【全部模式都显示】自动挡/自动曲线/手动/手动曲线只要在渐入就提示。
+    // 早先只在手动模式显示，是因为担心自动模式下温度一波动就触发小渐入、
+    // 胶囊反复闪；但实测那样会让用户误以为「自动挡不会渐入」。
+    // 真正让提示闪的是「无脑重写 innerHTML」——每帧赋值会让浏览器反复解析 HTML
+    // 并触发该行重排。这里改为**只在文案真的变了才写**，闪烁问题即消失，
+    // 于是不再需要模式门槛。
     var rp2 = $('rampPill');
     if(rp2){
-        if(ramping && CFG.mode === 'manual'){
-            var pillTxt = '渐入 ' + pct + '% → ' + tgtPct + '%';
+        if(ramping){
+            var pillTxt = (tgtRaw > pwm ? '升速' : '降速') + ' ' + pct + '% → ' + tgtPct + '%';
             if(rp2.style.display === 'none') rp2.style.display = '';
             rp2.className = 'pill ramp';
             if(rp2.getAttribute('data-txt') !== pillTxt){
@@ -933,29 +1117,37 @@ function updateStatus(now, svc){
         }
     }
 
-    // PWM 格内的渐入进度条：以本次渐入的起点为 0，目标为 100%
-    // rampFrom 在「开始渐入」那一刻记录当时的实际 pwm，渐入结束后清空
+    // PWM 格内的渐入进度条。
+    // 进度与剩余时间都来自服务端快照（ramp_active/from/to/dur/remain）：
+    // 服务端知道这段渐入的准确起点与时长，算出来的百分比在刷新间隔较大时也不会跳。
+    // 旧实现用「本次采样 pwm - 上次采样 pwm」反推，刷新一慢就严重滞后。
     if(ramping && !wasRamping){ rampFrom = pwm; }
     if(!ramping){ rampFrom = null; }
     wasRamping = ramping;
 
+    rampInfo = now.ramp_active === 1 ? now : null;
+
     var pT = $('pT'), jpBar = $('jpBar'), jpFill = $('jpFill'), jpText = $('jpText');
     if(pT && jpBar && jpFill && jpText && !isDirty()){
         var ok = false;
-        // 【只在手动模式显示】自动挡位/自动曲线/系统控制下，转速随温度自己调整，
-        // 每次温度波动都可能触发一次小渐入，提示反复闪 —— 对用户是纯噪声。
-        // 手动模式才是「用户点了保存、等风扇转到目标值」，这时提示才有意义。
-        if(ramping && CFG.mode === 'manual' && rampFrom !== null && tgtRaw !== null && tgtRaw !== rampFrom){
-            var span = tgtRaw - rampFrom;
-            var done = (pwm - rampFrom) / span;
-            done = done < 0 ? 0 : (done > 1 ? 1 : done);
-            pT.classList.add('ramping');
-            jpBar.style.display = '';
-            jpText.style.display = '';
-            jpFill.style.width = (done * 100).toFixed(1) + '%';
-            var left = Math.max(0, Math.round((1 - done) * (CFG.ramp_up || 0)));
-            jpText.textContent = (tgtRaw > rampFrom ? '升速' : '降速') + '中 · 约 ' + left + ' 秒到位';
-            ok = true;
+        // 【全部模式都显示】不再限定手动模式。
+        // 自动挡/自动曲线下由温度波动触发的小渐入同样有进度可看，
+        // 提示对用户是有信息的；闪烁问题已由「文案不变不重写」解决（见上方胶囊）。
+        if(rampInfo){
+            var rf = +rampInfo.ramp_from, rt = +rampInfo.ramp_to;
+            var dur = +rampInfo.ramp_dur, remain = Math.max(0, +rampInfo.ramp_remain);
+            if(dur > 0){
+                var done = (dur - remain) / dur;
+                done = done < 0 ? 0 : (done > 1 ? 1 : done);
+                pT.classList.add('ramping');
+                jpBar.style.display = '';
+                jpText.style.display = '';
+                jpFill.style.width = (done * 100).toFixed(1) + '%';
+                var left = remain >= 1 ? Math.ceil(remain) : 0;
+                jpText.textContent = (rt > rf ? '升速' : '降速') + '中 · ' +
+                                     (left > 0 ? '约 ' + left + ' 秒到位' : '即将到位');
+                ok = true;
+            }
         }
         if(!ok){
             pT.classList.remove('ramping');
@@ -1020,6 +1212,25 @@ function updateStatus(now, svc){
 }
 
 /* ---------- 温度→PWM 曲线 ---------- */
+// 【性能】这张图以前每轮轮询都整块重建：
+//   $('curveBox').innerHTML = '<svg>…</svg>'
+// 一次 innerHTML 赋值 = 丢弃整棵 SVG 子树 + 重新解析 + 重新布局 + 重新绘制。
+// 稳态 1 秒一次还勉强，但自动模式下温度在变、轮询也在跑，就明显发卡。
+//
+// 现在拆成两层：
+//   1) 静态层（网格 + 坐标 + 曲线路径）：只在**曲线参数变化**时重建，
+//      用一个签名（mode + 各阈值）比对，没变就直接复用；
+//   2) 动态层（红色温度标记）：单独一个 <g id="curveMark">，每帧只改两行
+//      line/text 的坐标与内容 —— 不碰 DOM 结构，成本可忽略。
+var curveSig = null;      // 上一次画曲线时的参数签名
+function curveSignature(){
+    var m = CFG.mode;
+    if(m === 'auto') return m + '|' + CFG.auto_temp_low + ',' + CFG.auto_temp_mid + ',' + CFG.auto_temp_high +
+                                     ',' + CFG.auto_pwm_low + ',' + CFG.auto_pwm_mid + ',' + CFG.auto_pwm_high;
+    if(m === 'auto_curve') return m + '|' + CFG.min_temp + ',' + CFG.max_temp + ',' + CFG.min_speed + ',' + CFG.max_speed;
+    if(m === 'manual') return m + '|' + CFG.manual_speed;
+    return m;
+}
 function drawCurve(){
     // 曲线图已并入风扇列（窄列），用更紧凑的纵横比，viewBox 会随容器等比缩放
     var W = 200, H = 150, ML = 28, MB = 22, MT = 8, MR = 6;
@@ -1051,31 +1262,49 @@ function drawCurve(){
         lineColor = '#f59e0b';
     }
 
-    var grid = '', labels = '';
-    [40,60,80,100].forEach(function(t){
-        grid += '<line x1="' + X(t) + '" y1="' + MT + '" x2="' + X(t) + '" y2="' + (H-MB) + '" stroke="#eef1f6"/>';
-        labels += '<text x="' + X(t) + '" y="' + (H-8) + '" font-size="9" fill="#8a94a6" text-anchor="middle">' + t + '°</text>';
-    });
-    // 纵轴按百分比标注（内部仍是 0~255，只是显示 0~100%）
-    [0, 20, 40, 60, 80, 100].forEach(function(p){
-        var y = Y(pct2raw(p));
-        grid += '<line x1="' + ML + '" y1="' + y.toFixed(1) + '" x2="' + (W-MR) + '" y2="' + y.toFixed(1) + '" stroke="#eef1f6"/>';
-        labels += '<text x="' + (ML-4) + '" y="' + (y+3).toFixed(1) + '" font-size="8.5" fill="#8a94a6" text-anchor="end">' + p + '%</text>';
-    });
+    var sig = curveSignature() + '|' + pts + '|' + lineColor;
+    var box = $('curveBox');
+    var sigChanged = (sig !== curveSig);
 
-    var marker = '';
-    if(lastTemp > 0 && lastTemp >= x0 && lastTemp <= x1){
-        marker = '<line x1="' + X(lastTemp) + '" y1="' + MT + '" x2="' + X(lastTemp) + '" y2="' + (H-MB) +
-                 '" stroke="#ef4444" stroke-dasharray="3 3"/>' +
-                 '<text x="' + X(lastTemp) + '" y="' + (MT+9) + '" font-size="9" fill="#ef4444" text-anchor="middle">' +
-                 lastTemp.toFixed(0) + '°</text>';
+    if(sigChanged){
+        curveSig = sig;
+        var grid = '', labels = '';
+        [40,60,80,100].forEach(function(t){
+            grid += '<line x1="' + X(t) + '" y1="' + MT + '" x2="' + X(t) + '" y2="' + (H-MB) + '" stroke="#eef1f6"/>';
+            labels += '<text x="' + X(t) + '" y="' + (H-8) + '" font-size="9" fill="#8a94a6" text-anchor="middle">' + t + '°</text>';
+        });
+        // 纵轴按百分比标注（内部仍是 0~255，只是显示 0~100%）
+        [0, 20, 40, 60, 80, 100].forEach(function(p){
+            var y = Y(pct2raw(p));
+            grid += '<line x1="' + ML + '" y1="' + y.toFixed(1) + '" x2="' + (W-MR) + '" y2="' + y.toFixed(1) + '" stroke="#eef1f6"/>';
+            labels += '<text x="' + (ML-4) + '" y="' + (y+3).toFixed(1) + '" font-size="8.5" fill="#8a94a6" text-anchor="end">' + p + '%</text>';
+        });
+        // 标记放进独立的 <g>，之后每帧只改它的坐标，不再重建整个 SVG
+        box.innerHTML =
+            '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;display:block">' +
+            grid + labels +
+            (pts ? '<path d="' + pts + '" fill="none" stroke="' + lineColor + '" stroke-width="2"/>' : '') +
+            '<g id="curveMark"></g></svg>';
+        // 把它暴露给下面的动态更新（闭包外要用）
+        curveGeom = { X:X, MT:MT, MB:MB };
+        curveMarkEl = null;    // 强制下面重新取一次节点
     }
 
-    $('curveBox').innerHTML =
-        '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;display:block">' +
-        grid + labels +
-        (pts ? '<path d="' + pts + '" fill="none" stroke="' + lineColor + '" stroke-width="2"/>' : '') +
-        marker + '</svg>';
+    // ---- 动态层：只动温度标记，不重建 SVG ----
+    var g = curveMarkEl || (curveMarkEl = document.getElementById('curveMark'));
+    if(!g) return;
+    var G = curveGeom;
+    var show = (lastTemp > 0 && lastTemp >= x0 && lastTemp <= x1);
+    var key = show ? Math.round(lastTemp * 10) : -1;
+    if(key === curveMarkKey) return;    // 温度没变（或同一次显示），完全不碰 DOM
+    curveMarkKey = key;
+    if(!show){ g.innerHTML = ''; return; }
+    var mx = G.X(lastTemp).toFixed(1);
+    g.innerHTML =
+        '<line x1="' + mx + '" y1="' + G.MT + '" x2="' + mx + '" y2="' + (H-G.MB) +
+        '" stroke="#ef4444" stroke-dasharray="3 3"/>' +
+        '<text x="' + mx + '" y="' + (G.MT+9) + '" font-size="9" fill="#ef4444" text-anchor="middle">' +
+        lastTemp.toFixed(0) + '°</text>';
 
     $('curveHint').textContent = m === 'auto' ? '台阶曲线：低于起转温度停转，各区间占空比恒定。'
         : m === 'auto_curve' ? '线性曲线：温度在起始与满速之间时占空比线性上升。'
@@ -1084,10 +1313,18 @@ function drawCurve(){
 
 /* ---------- 历史图表 ---------- */
 var canvas = $('tempChart'), ctx = canvas.getContext('2d');
+// 【性能】给 canvas.width/height 赋值会**重新分配整块位图并清空**，
+// 即使赋的是同一个值。以前每轮轮询都无脑赋值一次 = 每帧丢弃重建位图。
+// 现在只在尺寸真的变了（首次渲染 / 窗口缩放）时才重设，其余帧只做 clearRect。
+var chartW = 0, chartH = 0, chartDpr = 0;
 function drawChart(){
     var rect = canvas.getBoundingClientRect();
     var dpr = window.devicePixelRatio || 1;
-    canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+    var needW = Math.round(rect.width * dpr), needH = Math.round(rect.height * dpr);
+    if(needW !== chartW || needH !== chartH || dpr !== chartDpr){
+        chartW = needW; chartH = needH; chartDpr = dpr;
+        canvas.width = needW; canvas.height = needH;
+    }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     var w = rect.width, h = rect.height;
     ctx.clearRect(0, 0, w, h);
@@ -1130,13 +1367,35 @@ function drawChart(){
     ctx.lineTo(mg.left + (n-1) * xs, h - mg.bottom); ctx.lineTo(mg.left, h - mg.bottom);
     ctx.closePath(); ctx.fillStyle = g; ctx.fill();
 
-    // PWM：亮蓝色实线（改成实线 + 更粗 + 光晕，便于和纵轴百分比对照）
+    // PWM：亮蓝色虚线（与温度实线区分开）
+    //
+    // 【为什么以前看着像实线】关键在 canvas 的规范细节：**setLineDash 的数组是
+    // 按 lineWidth 缩放的**（实际段长 = 数组值 × lineWidth / 2）。
+    // 旧代码用同一个 [7,5] 先后描了两遍：
+    //   外发光 lineWidth=5 → 实际虚线段被拉长到 ~17.5px，空隙 ~12.5px
+    //   主线   lineWidth=2.2 → 段长 ~7.7px，空隙 ~5.5px
+    // 两条线的**相位还各自从起点重算**，于是 5px 宽的发光层正好糊在主线空档上，
+    // 两者叠加后视觉上就是一条连续的粗蓝线 —— 怎么调颜色都「不虚」。
+    //
+    // 修法：发光层不再用虚线，改成**极低透明度的实线垫底**（负责“发光”观感），
+    // 虚线只由主线画一遍，段长干净可控。两者互不干扰，虚线才真的看得出来。
     ctx.save();
     ctx.beginPath();
     historyData.forEach(function(d, i){ i ? ctx.lineTo(mg.left + i * xs, sy(d.speed)) : ctx.moveTo(mg.left, sy(d.speed)); });
-    ctx.strokeStyle = 'rgba(59,130,246,.22)'; ctx.lineWidth = 5; ctx.stroke();   // 外发光
-    ctx.strokeStyle = '#2563eb';              ctx.lineWidth = 2.2; ctx.stroke(); // 主线
+
+    // ① 发光垫底：实线、低透明、稍粗，只提供光晕，不参与“虚线”表达
+    ctx.setLineDash([]);
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(59,130,246,.14)'; ctx.lineWidth = 5.5; ctx.stroke();
+
+    // ② 主线：唯一的虚线层。段长放大到 9×6，在 2.2px 线宽下约 10px/7px，
+    //    远看清楚分明，又不会碎成点。
+    ctx.beginPath();
+    historyData.forEach(function(d, i){ i ? ctx.lineTo(mg.left + i * xs, sy(d.speed)) : ctx.moveTo(mg.left, sy(d.speed)); });
+    ctx.setLineDash([9, 6]);
+    ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2.2; ctx.stroke();
     ctx.restore();
+    ctx.setLineDash([]);   // 复位，避免影响后续绘制
 
     // 曲线末端小圆点，强化“这是转速百分比曲线”的观感
     var li = n - 1;
@@ -1154,27 +1413,10 @@ syncExtras();
 checkGuardOrder();
 drawCurve();
 markDirty();
-
-// 【修复4-刷新率】改用链式 setTimeout + 动态节拍，不再 setInterval 到底。
-// 为什么不用 setInterval：请求变慢时它会堆积（上一次还没回来下一次又发了），
-// 而且改节拍必须 clearInterval 重建。链式调度天然保证「上一次回来才发下一次」。
-function syncPollRate(fast){
-    var want = fast ? FAST_MS : SLOW_MS;
-    if(want === pollMsNow && pollTimer) return;   // 档位没变就沿用，不重建定时器
-    pollMsNow = want;
-    if(pollTimer){ clearTimeout(pollTimer); pollTimer = null; }
-    pollTimer = setTimeout(pollTick, pollMsNow);
-}
-function pollTick(){
-    pollTimer = null;
-    fetchData().then(function(){
-        // 请求回来再排下一拍；档位由 updateStatus 里的 syncPollRate 决定
-        if(!pollTimer) pollTimer = setTimeout(pollTick, pollMsNow);
-    });
-}
-
+// 首屏立刻拉一次，然后交给链式轮询自己续拍（见 syncPollRate / pollTick）。
+// 不再用 setInterval：节拍需要在「稳态 1 秒 / 渐入 250ms」之间切换。
 fetchData();
-pollTimer = setTimeout(pollTick, pollMsNow);
+pollTick();
 window.addEventListener('resize', drawChart);
 
 var _origUpdate = updateStatus;
