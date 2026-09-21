@@ -1048,12 +1048,26 @@ function updateStatus(now, svc){
     var tgtPct = tgtRaw === null ? null : raw2pct(tgtRaw);
     var ramping = tgtPct !== null && tgtRaw !== pwm;
 
-    // 【提速窗口】只认服务端快照的 ramp_active（见 inFastWindow 注释）。
-    // 用本轮 now 直接判，而不是读模块级 rampInfo —— 后者要等函数后半段才更新，
-    // 这里读到的会是上一轮的值，会让提速窗口晚一拍开始、晚一拍结束。
-    // fastUntil 兜住「点保存 → 服务端第一拍快照回来」这段空窗。
-    var rampActive = (now.ramp_active === 1);
-    syncPollRate(rampActive || fastUntil > Date.now());
+    // 服务端快照里的目标值：用于「是否还需高频轮询」——只要实际 pwm 还没追到它，
+    // 就保持快档；ramp_active 已经归 0 但 pwm 还差最后一格时也不会提前降档。
+    //
+    // 【必须在下面 syncPollRate 之前赋值】否则读到的还是上一轮的旧值，
+    // 提速窗口会晚一拍开始、晚一拍结束 —— 这正是最初改动时踩过的坑。
+    rampTargetRaw = (now.ramp_to !== undefined && now.ramp_to !== null) ? +now.ramp_to : null;
+
+    // 【提速窗口】判据恢复为「本地推算的渐入状态 + 服务端目标值」，
+    // 而不是只看服务端的 ramp_active。
+    //
+    // 为什么改回来：只看 ramp_active 会在**渐入末尾**提前降档 ——
+    // 守护进程把 ramp_active 归 0 的时刻，实际 pwm 往往还差最后一格没追上。
+    // 一旦降到 SLOW_MS(1 秒)，进度条尾部就只能按 1 秒一格地跳，
+    // 前面还在 250ms 平滑走、最后一段突然变得一顿一顿，观感就是「动画变差了」。
+    //
+    // rampTargetRaw 取自服务端快照的 ramp_to：只要 pwm 还没追到它就一直保持快档，
+    // 正好补上这段尾巴。ramping 是本地用 history 末行推算的，覆盖温度波动
+    // 触发的自动渐入；fastUntil 兜住「点保存 → 第一拍快照回来」之间的空窗。
+    // 三者取或，谁先触发都能及时提速，且不会提前掉档。
+    syncPollRate(ramping || (rampTargetRaw !== null && pwm !== rampTargetRaw) || fastUntil > Date.now());
 
     $('tTile').textContent = temp.toFixed(1);
     $('rTile').textContent = rpm;
@@ -1095,9 +1109,6 @@ function updateStatus(now, svc){
     wasRamping = ramping;
 
     rampInfo = now.ramp_active === 1 ? now : null;
-    // 服务端快照里的目标值：用于「是否还需高频轮询」——只要实际 pwm 还没追到它，
-    // 就保持快档；ramp_active 已经归 0 但 pwm 还差最后一格时也不会提前降档。
-    rampTargetRaw = (now.ramp_to !== undefined && now.ramp_to !== null) ? +now.ramp_to : null;
 
     var pT = $('pT'), jpBar = $('jpBar'), jpFill = $('jpFill'), jpText = $('jpText');
     if(pT && jpBar && jpFill && jpText && !isDirty()){
