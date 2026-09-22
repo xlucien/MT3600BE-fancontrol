@@ -12,13 +12,13 @@
 
 ### 完整界面
 
-![完整界面](screenshots/full-ui.png)
+![完整界面](https://raw.githubusercontent.com/xlucien/gl-mt3600be-fan-control/main/screenshots/full-ui.png)
 
 状态卡（温度 / 转速 / PWM / 模式）、会转的风扇图标、温度 / 转速历史双轴曲线、手动 PWM 卡片、参数面板。
 
 ### 转速警戒（PWM > 80%）
 
-![彩虹扇叶](screenshots/rainbow-blades.png)
+![彩虹扇叶](https://raw.githubusercontent.com/xlucien/gl-mt3600be-fan-control/main/screenshots/rainbow-blades.png)
 
 手动 PWM 超过 80% 时五片扇叶依次染红 / 橙 / 黄 / 绿 / 蓝，轮毂转深灰；回落自动恢复蓝色。0.5s 平滑过渡，不会闪变。
 
