@@ -44,12 +44,44 @@ end
     #fc .fan-curve .hint { font-size:11px; line-height:1.5; text-align:center; margin-top:6px; }
     #fc .fan-ring { width:116px; height:116px; border-radius:50%; background:#eaf2fd;
                     display:flex; align-items:center; justify-content:center; transition:background .3s; }
-    #fc .fan-rotor { transform-origin:36px 36px; animation:fc-spin var(--fan-dur,2s) linear infinite; }
-    #fc .stopped .fan-rotor { animation:none; }
+    /* 转子旋转由 JS 的 rAF 按角速度积分驱动（见脚本里的 fanSpin）。
+       【为什么不再用 CSS animation】
+       原来是 animation:fc-spin + 每轮改 --fan-dur（animation-duration）来变速。
+       改 animation-duration 虽然不会"重启"动画，但浏览器会用**新时长**去重新
+       解释已经流逝的时间，角度瞬间跳变：PWM 每变 1 约跳 1.7°，而升速中 PWM
+       一次跳 8~17 很常见，那时能跳 20° —— 用户看到的就是"一顿一顿"。
+       改成积分后，速度变化只改角速度、角度本身连续，不会跳。 */
+    /* transform-box 必须显式写 view-box：
+       转子的旋转中心要落在这个 SVG 的 viewBox 坐标 (36,36) 上，
+       而不是元素自身包围盒的某个百分比位置（默认行为在不同浏览器上不一致，
+       而且 5 叶扇形的包围盒中心本来就不等于旋转中心，靠它会偏）。
+       旋转由 JS 写 style.transform=rotate(Ndeg) 驱动，详见脚本里的 fanSpin。
+       【别改用 SVG 的 transform="rotate(a 36 36)" 属性】
+       试过，会和这里的 transform-origin 叠加成一次带轴的三维旋转，
+       转子被甩出 SVG 范围 —— 表现为「扇叶不居中」。 */
+    #fc .fan-rotor { transform-box:view-box; transform-origin:36px 36px; will-change:transform; }
     #fc .stopped .fan-ring { background:#f1f3f7; }
     #fc .stopped .blade { fill:#c3cad6; }
     #fc .stopped .hub { fill:#aeb7c4; }
-    @keyframes fc-spin { to { transform:rotate(360deg); } }
+
+    /* 高速彩虹：PWM 超过 80% 时扇叶变彩虹色（红橙黄绿蓝各一片）。
+       视觉上直接告诉你「风扇正在高速跑」，比看数字更直观。
+       - 用 nth-of-type 定位：五片叶是 .fan-rotor 里连续排列的 5 个 <path>，
+         顺序稳定；轮毂是 <circle>，不会被算进来。
+       - fill 是 SVG 的呈现属性，CSS 能覆盖它 —— 上面 .stopped .blade
+         就是这么做的，这里同理。
+       - 加 transition 让切换是渐变而不是硬跳。
+       阈值见脚本里的 RAINBOW_PCT。 */
+    #fc .blade, #fc .hub { transition:fill .5s ease; }
+    #fc .rainbow .blade:nth-of-type(1) { fill:#e8453c; }
+    #fc .rainbow .blade:nth-of-type(2) { fill:#f0913c; }
+    #fc .rainbow .blade:nth-of-type(3) { fill:#e8c53c; }
+    #fc .rainbow .blade:nth-of-type(4) { fill:#4aa564; }
+    #fc .rainbow .blade:nth-of-type(5) { fill:#4a8af4; }
+    /* 轮毂转中性灰，让五片彩叶更跳出来 */
+    #fc .rainbow .hub { fill:#6b7688; }
+    /* @keyframes fc-spin 已随转子改用 rAF 积分而删除（不再有 CSS 动画引用它）。
+       若哪天要退回 CSS 动画方案，记得把它加回来。 */
 
     #fc .pill { display:inline-flex; align-items:center; gap:6px; padding:3px 11px; border-radius:999px;
                 font-size:12px; font-weight:600; }
@@ -150,13 +182,15 @@ end
     #fc .dot.r { background:var(--hot); box-shadow:0 0 0 3px #fdecec; }
     #fc .svc-row .r { font-size:12px; color:var(--muted); }
 
-    /* 分段控件：浅灰凹槽，选中项 = 白色浮起小块（不是蓝色实心） */
+    /* 分段控件：浅灰凹槽，选中项 = 白色浮起小块（不是蓝色实心）。
+       【别再加回那圈深色细环】原来选中项除了投影还叠了一层
+       0 0 0 .5px rgba(16,24,40,.04)，用户看着就像按键旁边有个黑框，
+       已按反馈去掉 —— 只保留柔投影就够了。 */
     #fc .seg { display:inline-flex; background:#f2f4f8; border-radius:10px; padding:3px; gap:2px; flex-wrap:wrap; }
     #fc .seg button { border:0; background:transparent; padding:7px 18px; border-radius:8px;
                       font-size:13px; font-weight:600; color:#7c8698; cursor:pointer; transition:all .15s; }
     #fc .seg button:hover:not(.active) { color:var(--text); }
-    #fc .seg button.active { background:#fff; color:var(--text); box-shadow:0 1px 3px rgba(16,24,40,.1),
-                            0 0 0 .5px rgba(16,24,40,.04); }
+    #fc .seg button.active { background:#fff; color:var(--text); box-shadow:0 1px 3px rgba(16,24,40,.08); }
 
     #fc .panel { display:none; }
     #fc .panel.show { display:block; }
@@ -229,29 +263,43 @@ end
     #fc input[type=range]::-moz-range-thumb { width:16px; height:16px; border-radius:50%; background:#fff;
                             border:2px solid var(--brand); cursor:pointer; }
     /* 档位胶囊：放进一条浅灰凹槽里，与分段控件 / 时间输入同一套「槽 + 白块」语言。
-       五个按钮等宽平分，不再用 flex-wrap 参差换行。
+       【4 个键】原本是 5 个（含「超静音 20%」），用户要求去掉超静音档，
+       所以 grid-template-columns 必须同步改成 repeat(4, ...)，
+       否则会空出一格、剩下的键被挤窄。
+       四个键等宽平分，不再用 flex-wrap 参差换行。
        标签拆成「档名 + 百分比」两行——"超静音 20%" 这种长短不一的写法
-       会让等宽格子里的按钮宽窄失衡。做成上档名下数值后，五个格子完全对齐。 */
-    #fc .chips { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr));
-                 gap:4px; margin-top:12px; padding:3px;
-                 background:#f2f4f8; border-radius:11px; }
+       会让等宽格子里的按钮宽窄失衡。做成上档名下数值后，四个格子完全对齐。
+
+       【钢琴键式】五个键连成一排、共边，像钢琴的白键：
+         - 键与键之间只用 1px 缝隙，缝隙透出容器底色当分隔线（不再各自 gap 4px）；
+         - 圆角只留整体一圈，靠容器 overflow:hidden 裁齐首尾，键本身是方角。
+
+       【外框与模式按键统一】外框直接照抄分段控件 .seg 的参数：
+       背景 #f2f4f8、圆角 10px、内边距 3px。两处都是「浅灰凹槽里放一排键」，
+       视觉重量一致后才像同一套组件。原来的 #e3e9f2 底色 + 1px 同色描边
+       偏重、偏冷，跟模式按键摆在一起明显不是一家，已去掉那圈描边。
+       停转（0%）是全页唯一的危险操作，保留红键 —— 在一排白键里它天然醒目，
+       又不会引入新的深色块（用户此前刚反馈过按键附近有"黑框"）。 */
+    #fc .chips { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr));
+                 gap:1px; margin-top:12px; padding:3px;
+                 background:#f2f4f8;                 /* 与 .seg 同色：1px 缝隙与 3px 内圈都透出它 */
+                 border-radius:10px; overflow:hidden; }
     #fc .chip { display:flex; flex-direction:column; align-items:center; gap:1px;
-                border:1px solid transparent; background:transparent; border-radius:8px;
-                padding:7px 4px; font-size:12.5px; font-weight:600; color:var(--text);
-                cursor:pointer; transition:all .15s; line-height:1.25; }
+                border:0; background:#fff; border-radius:6px;
+                padding:8px 4px; font-size:12.5px; font-weight:600; color:var(--text);
+                cursor:pointer; transition:background .15s; line-height:1.25; }
     #fc .chip b { font-weight:600; }
     #fc .chip em { font-style:normal; font-size:11.5px; color:var(--muted); font-weight:600;
                    font-variant-numeric:tabular-nums; }
-    /* 悬停：白块浮起，与分段控件选中态一致 */
-    #fc .chip:hover { background:#fff; color:var(--text);
-                      box-shadow:0 1px 3px rgba(16,24,40,.1), 0 0 0 .5px rgba(16,24,40,.04); }
-    #fc .chip:active { background:#eef2f8; box-shadow:none; }
-    /* 停转：全页唯一的危险操作，用红实心标出来 */
-    #fc .chip.danger { background:#e8453c; border-color:#e8453c; color:#fff;
-                       box-shadow:0 1px 3px rgba(232,69,60,.3), 0 3px 10px rgba(232,69,60,.2); }
+    /* 悬停：白键轻染品牌色即可。不再用白块浮起 + 深色细环 ——
+       键本来就是白的，浮起来没意义，细环正是用户要去掉的"黑框"。 */
+    #fc .chip:hover { background:#f2f7ff; }
+    #fc .chip:active { background:#e6eefb; }
+    /* 停转：一排白键里的红键。同样不再有外圈阴影/描边 */
+    #fc .chip.danger { background:#e8453c; color:#fff; }
     #fc .chip.danger em { color:rgba(255,255,255,.82); }
-    #fc .chip.danger:hover { background:#d93b32; border-color:#d93b32; color:#fff;
-                             box-shadow:0 2px 6px rgba(232,69,60,.36), 0 5px 14px rgba(232,69,60,.24); }
+    #fc .chip.danger:hover { background:#d93b32; }
+    #fc .chip.danger:active { background:#c7332b; }
 
     #fc canvas { width:100%; height:220px; display:block; }
     #fc .legend { display:flex; gap:16px; font-size:12px; color:var(--muted); margin-top:8px; }
@@ -449,7 +497,6 @@ end
             <div class="mp-cap">0% 关闭风扇，1% - 100% 直接设置 PWM。可直接输入百分比，或拖动滑条。</div>
             <div class="chips">
                 <button class="chip danger" onclick="quickPwm(0)"><b>停转</b><em>0%</em></button>
-                <button class="chip" onclick="quickPwm(20)"><b>超静音</b><em>20%</em></button>
                 <button class="chip" onclick="quickPwm(30)"><b>静音</b><em>30%</em></button>
                 <button class="chip" onclick="quickPwm(50)"><b>中速</b><em>50%</em></button>
                 <button class="chip" onclick="quickPwm(100)"><b>全速</b><em>100%</em></button>
@@ -1172,12 +1219,22 @@ function updateStatus(now, svc){
     }
 
     var box = $('fanBox'), pill = $('runPill');
+    // 超过 80% 就把扇叶染成彩虹色（视觉提示「正在高速运转」）。
+    // 用 class 切换而不是直接改 fill，配色交给 CSS 管，阈值只在这里出现一次。
+    if(pct > RAINBOW_PCT) box.classList.add('rainbow');
+    else box.classList.remove('rainbow');
+
     if(pwm === 0){
+        fanStopped = true;
         box.classList.add('stopped');
         pill.className = 'pill stop'; pill.innerHTML = '<i></i>已停转';
     } else {
+        fanStopped = false;
         box.classList.remove('stopped');
-        $('fanBox').style.setProperty('--fan-dur', (2.4 - 2.0 * pwm / 255).toFixed(2) + 's');
+        // 转速映射：PWM 越大转得越快，一圈耗时 2.4s → 0.4s。
+        // 只改角速度，角度由 fanSpin 连续积分 —— 不再像以前那样改
+        // animation-duration 导致角度跳变（详见 CSS 里 .fan-rotor 的注释）。
+        fanDur = 2.4 - 2.0 * pwm / 255;
         pill.className = 'pill run'; pill.innerHTML = '<i></i>运行中';
     }
 
@@ -1405,6 +1462,37 @@ function drawChart(){
     ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
 }
 
+/* ---------- 风扇转子旋转（rAF 角速度积分）---------- */
+//
+// 【为什么不用 CSS animation】
+// 原来 .fan-rotor 用 animation:fc-spin，靠改 --fan-dur（animation-duration）变速。
+// 改 animation-duration 不会重启动画，但浏览器会拿「新时长」重新解释已流逝的
+// 时间，角度立刻跳一下 —— 每轮刷新只要 PWM 变了就顿一下，PWM 一次跳 8~17
+// （升速中很常见）时能跳 20°。
+//
+// 改成积分后：每帧按当前角速度累加角度。速度变了只是角速度变，
+// 角度本身连续，所以加减速都是平滑的，不会跳。
+var fanAngle = 0, fanLastT = 0, fanDur = 2.4, fanStopped = true;
+// 扇叶变彩虹色的阈值（百分比）。需求是「超过 PWM 80%」，所以判据用 pct > 80；
+// 若想让正好 80% 也触发，把 > 改成 >= 即可。
+var RAINBOW_PCT = 80;
+function fanSpin(t){
+    requestAnimationFrame(fanSpin);
+    var rotor = $('fanRotor');
+    if(!rotor) return;
+    var dt = fanLastT ? (t - fanLastT) / 1000 : 0;
+    fanLastT = t;
+    // 标签页切走再切回时 dt 会很大，钳住，否则会瞬间转一大圈
+    if(dt > 0.25) dt = 0.25;
+    if(fanStopped || fanDur <= 0) return;
+    fanAngle = (fanAngle + 360 * dt / fanDur) % 360;
+    // 用 CSS transform，旋转中心由 .fan-rotor 的 transform-origin 属性
+    // （值 36px 36px）+ transform-box:view-box 决定。
+    // 【不要用 rotor.setAttribute('transform','rotate(a 36 36)')】
+    // 那样会和 transform-origin 叠加成三维旋转，转子被甩出 SVG。
+    rotor.style.transform = 'rotate(' + fanAngle.toFixed(2) + 'deg)';
+}
+
 /* ---------- 启动 ---------- */
 buildRows();
 syncModeUI();
@@ -1417,6 +1505,7 @@ markDirty();
 // 不再用 setInterval：节拍需要在「稳态 1 秒 / 渐入 250ms」之间切换。
 fetchData();
 pollTick();
+requestAnimationFrame(fanSpin);
 window.addEventListener('resize', drawChart);
 
 var _origUpdate = updateStatus;

@@ -10,7 +10,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-fancontrol
-PKG_VERSION:=3.15
+PKG_VERSION:=3.16
 PKG_RELEASE:=1
 
 PKG_LICENSE:=MIT
