@@ -66,7 +66,8 @@ function action_data()
                   "auto_pwm_low","auto_pwm_mid","auto_pwm_high",
                   "min_temp","max_temp","min_speed","max_speed","interval",
                   "night_enabled","night_start","night_end","night_speed",
-                  "guard_enabled","guard_temp","guard_exit","guard_speed","ramp_up"}
+                  "guard_enabled","guard_temp","guard_exit","guard_speed","ramp_up",
+                  "temp_smooth"}
     local cp = {}
     for _, k in ipairs(keys) do
         local v = uci:get("fancontrol", "main", k) or ""
@@ -149,7 +150,8 @@ function action_save()
                       "auto_pwm_low","auto_pwm_mid","auto_pwm_high",
                       "min_temp","max_temp","min_speed","max_speed",
                       "night_enabled","night_start","night_end","night_speed",
-                      "guard_enabled","guard_temp","guard_exit","guard_speed","ramp_up"}
+                      "guard_enabled","guard_temp","guard_exit","guard_speed","ramp_up",
+                      "temp_smooth"}
     for _, k in ipairs(seenkeys) do
         local v = field(k)
         seen[#seen+1] = k .. "=" .. (v == nil and "-" or v:gsub("[^%w_%.%-:]", "?"))
@@ -187,7 +189,10 @@ function action_save()
         {"guard_temp", 40, 120, 90},
         {"guard_exit", 30, 120, 80},
         {"guard_speed", 0, 255, 178},
-        {"ramp_up", 0, 120, 30}
+        {"ramp_up", 0, 120, 30},
+        -- 控制温度平滑窗口（秒）。0 = 关闭平滑。
+        -- 传感器噪声约 ±1.9°C，经曲线增益放大后会让目标每秒都变，0 会退化成抽搐。
+        {"temp_smooth", 0, 60, 5}
     }
     for _, s in ipairs(specs) do
         local v = field(s[1])

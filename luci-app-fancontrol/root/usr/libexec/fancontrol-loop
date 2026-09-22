@@ -392,6 +392,10 @@ while true; do
     guard_exit=$(get_config guard_exit 80)
     guard_speed=$(get_config guard_speed 178)
     ramp_up=$(get_config ramp_up 30)
+    # 控制温度的平滑窗口（秒）。0 = 关闭平滑。
+    # 默认 5 秒：MT798x 传感器噪声约 ±1.9°C，经曲线增益放大后会让目标每秒都变，
+    # 不做平滑的话 PWM 会持续摆动（详见下方「控制温度指数平滑」注释）。
+    temp_smooth=$(get_config temp_smooth 5)
     # 守护状态跨轮保持（触发温度与退出温度之间的区间保持原状，避免抖动）
     # 优先从状态文件恢复，保证 daemon 重启后闭锁状态不丢
     if [ -r "$STATE_FILE" ]; then
@@ -437,6 +441,32 @@ while true; do
     for temp in "$cpu_temp_c" "$wifi0_temp_c" "$wifi1_temp_c" "$eth_temp_c"; do
         [ -n "$temp" ] && control_temp_c=$(awk -v cur="$control_temp_c" -v new="$temp" 'BEGIN {if (new+0 > cur+0) printf "%.1f", new; else printf "%.1f", cur}')
     done
+
+    # ===== 控制温度指数平滑 =====
+    # MT798x 的片上传感器噪声很大：实测同一秒内 tz0 在 60.9~62.7°C 之间跳，
+    # hwmon0(CPU) 更夸张，59.4~62.6°C（±1.6°C）；再叠上这里「取多个传感器最大值」
+    # 的策略，等于专门挑最抖的那个峰值，合成后抖动约 ±1.9°C。
+    #
+    # 噪声经曲线增益放大后非常致命：当前曲线 (255-50)/(70-40) = 6.83 PWM/°C，
+    # 1.9°C 抖动就是 13 个 PWM 的目标摆动。目标每秒都变，渐入就永远走不完。
+    #
+    # 所以取完最大值后再做一次一阶低通（EMA）：
+    #     T_ema = T_ema + α * (T_raw - T_ema),   α = interval / temp_smooth
+    # α = 1/5 表示约 5 秒窗口，噪声可压到约 ±0.5°C，真实温度变化约 5 秒内跟上。
+    # 散热是慢过程，这点延迟无感，但足以让目标值稳定下来。
+    #
+    # temp_ema 会写进状态文件，daemon 重启（含保存热重载）后接着平滑，不会跳变。
+    # temp_smooth=0 表示关闭平滑（退回原始值，供调试对比用）。
+    if [ -n "$control_temp_c" ]; then
+        if is_uint "$temp_smooth" && [ "$temp_smooth" -gt 0 ] && is_uint "$interval" && [ "$interval" -gt 0 ]; then
+            if [ -n "$temp_ema" ]; then
+                control_temp_c=$(awk -v p="$temp_ema" -v n="$control_temp_c" -v i="$interval" -v w="$temp_smooth" \
+                    'BEGIN{ a = i / w; if (a > 1) a = 1; if (a < 0.01) a = 0.01
+                            printf "%.1f", p + a * (n - p) }')
+            fi
+        fi
+        temp_ema=$control_temp_c
+    fi
 
     fan_rpm=""
     if [ -n "$FAN_SPEED_SOURCE" ] && [ -r "$FAN_SPEED_SOURCE" ]; then
@@ -577,14 +607,43 @@ while true; do
         target_speed=$speed
 
         # 转速渐入：无论升速还是降速都平滑过渡。
-        # busybox 的 sleep 只接受整数秒（无 usleep），所以不能在单个轮询周期里做亚秒细分；
-        # 改为「按经过时间插值」：记录本次渐入的起点值与起点时间，每次循环按
-        # 已流逝秒数算出应到达的 PWM，既平滑又不依赖小数 sleep。
         #
-        # 时长按「量程比例」折算，而不是固定 ramp_up 秒：
-        # 固定时长会导致 10% 的小改动也要慢慢磨满 30 秒，观感很差；
-        # 按 span/255 折算后，小改动一两秒到位，大改动才用满 ramp_up 秒。
-        # 下限 min_s 是为了避免 1% 的改动被一个轮询周期瞬间跳过、看不到任何过程。
+        # 【恒定斜率，不再记起点时刻】
+        #
+        # 旧实现是「记 ramp_from/ramp_start，按 elapsed/dur 线性插值」，并且
+        # 一旦目标变化就重置 ramp_start。这在温度稳定时没问题，但实测：
+        # 传感器噪声 ±1.9°C × 曲线增益 6.83 PWM/°C → 目标每秒都在变
+        # （30 秒内目标变了 30 次），于是每轮都命中重置分支：
+        #       ramp_start = now  →  elapsed = 0  →  插值结果 = ramp_from
+        # PWM 一步都走不出去，全程卡死在 187 纹丝不动。
+        #
+        # 改成「每拍朝目标走固定步长」后不存在「重置」这个概念：
+        # 目标随时可变、方向随时可改，已走过的进度永不丢失。
+        #
+        # 斜率 = 满量程 255 / ramp_up 秒（ramp_up=30 时约 8.5 PWM/秒、3.3%/秒），
+        # 这与旧公式 dur = ramp_up*|Δ|/255 在数学上等价 —— 那个公式本身就是恒定斜率，
+        # 只是实现方式绕了一圈、且绕的那圈踩了坑。
+        #
+        # 步长按「本拍真实时长 dt」折算（见下方 dt 的计算），所以平均斜率
+        # 既与采样间隔无关，也与循环体自身的开销无关。
+        # busybox 的 sleep 只接受整数秒（无 usleep、无 read -t 小数），
+        # 做不到亚秒细分；但 PWM 驱动的是物理风扇本身带惯性，1 秒一档足够平滑，
+        # 「看着流畅」由页面侧 250ms 快档插值负责。
+        # 本拍真实时长。循环体本身有开销（十来次 awk + 若干 sysfs 读），
+        # 实测周期约 1.5 秒而不是配置里的 1 秒 —— 若按 $interval 折算步长，
+        # 实际斜率只有配置值的六成，ramp_up=30 会变成实际近 50 秒走完全程，
+        # 页面显示的「约 N 秒到位」也会明显偏短。改成按真实 dt 折算后，
+        # 斜率恒等于 255/ramp_up，与循环开销解耦，剩余秒数也准了。
+        # dt 上限 5 秒：万一 daemon 被挂起过久，也不至于一拍跳完全程。
+        now_s=$(date +%s)
+        dt=$interval
+        if [ -n "$last_tick_s" ]; then
+            dt=$(( now_s - last_tick_s ))
+            [ "$dt" -lt 1 ] && dt=1
+            [ "$dt" -gt 5 ] && dt=5
+        fi
+        last_tick_s=$now_s
+
         if [ "$cur_speed" -lt 0 ]; then
             # 首轮直接到位，避免开机时从 0 慢慢爬
             cur_speed=$speed
@@ -593,31 +652,69 @@ while true; do
             ramp_start=0
             ramp_dur=0
         elif is_uint "$ramp_up" && [ "$ramp_up" -gt 0 ] && is_uint "$interval" && [ "$interval" -gt 0 ]; then
-            now_s=$(date +%s)
             if [ "$speed" -ne "$cur_speed" ]; then
-                # 目标变了才重开一段渐入。注意只比对 ramp_to：不能用 cur_speed 判断，
-                # 因为渐入过程中 cur_speed 每轮都在变，会把自己反复重置、永远走不完。
-                if [ "$ramp_to" != "$speed" ]; then
-                    ramp_from=$cur_speed
+                prev_speed=$cur_speed
+                cur_speed=$(awk -v c="$cur_speed" -v t="$speed" -v a="$ramp_up" -v tk="$dt" \
+                    'BEGIN{
+                        d = t - c
+                        if (d == 0) { printf "%d", c; exit }
+                        s = (d > 0) ? 1 : -1
+                        if (d < 0) d = -d
+                        rps = 255 / a                # 每秒斜率（PWM/秒）
+                        need = d / rps               # 走完还需要的秒数
+                        # 太小的改动也铺成约 2 秒：否则 1% 的调整一个周期就跳完，
+                        # 页面完全看不到过程。
+                        # 注意这里用的是「时间」而不是「拍数」—— 循环周期在 1~2 秒
+                        # 之间抖动，按拍数算会让步长跟着忽大忽小。
+                        if (need < 2) need = 2
+                        step = int(d * tk / need)    # 本拍走掉 need 时间里的 tk 份额
+                        if (step < 1) step = 1
+                        if (step > d) step = d       # 不许越过目标
+                        printf "%d", c + s * step }')
+
+                if [ "$cur_speed" -eq "$speed" ]; then
+                    # 本拍已到位
+                    ramp_from=-1
+                    ramp_to=-1
+                    ramp_start=0
+                    ramp_dur=0
+                else
+                    # 进度条锚点：本段渐入的起点 PWM。
+                    # 只有「上一段已结束」或「行进方向反转」才重设锚点；
+                    # 目标小幅移动不重设，否则进度条会来回跳。
+                    if [ "$ramp_from" -lt 0 ] 2>/dev/null || [ "$ramp_to" -lt 0 ] 2>/dev/null; then
+                        ramp_from=$prev_speed
+                    elif awk -v f="$ramp_from" -v o="$ramp_to" -v n="$speed" \
+                        'BEGIN{ a = o - f; b = n - f
+                                # 只有「严格同向」才保留锚点；反向、或任一为 0 都重设。
+                                # b == 0（新目标正好等于锚点）必须重设：否则 to == from，
+                                # 距离算成 0、dur 被压到最小值 2 秒，剩余时间全程显示 2 秒。
+                                # 真实场景：从 245 往下降到 20 的途中把目标改回 245，
+                                # 锚点还停在上一段的 245，就会出现这个退化。
+                                if ((a > 0 && b > 0) || (a < 0 && b < 0)) exit 1
+                                exit 0 }'; then
+                        ramp_from=$prev_speed
+                    fi
                     ramp_to=$speed
-                    ramp_start=$now_s
-                    # 本次渐入时长（秒，浮点）：ramp_up * |Δ| / 满量程，再夹在 [min_s, ramp_up]
-                    ramp_dur=$(awk -v a="$ramp_up" -v f="$ramp_from" -v t="$ramp_to" \
-                        'BEGIN{ s = t - f; if (s < 0) s = -s;
-                                d = a * s / 255;
-                                mn = a / 8; if (mn < 2) mn = 2;
-                                if (mn > a) mn = a;
-                                if (d < mn) d = mn; if (d > a) d = a;
-                                printf "%.1f", d }')
+                    # 全程预计秒数 = |to - from| / 斜率，取整秒且至少 1 秒。
+                    # 必须是整数：控制器解析 ramp 文件用的是 (%w+)=(%-?%d+)，
+                    # 小数会被截断（"3.8" 只认成 3），这里直接给整数更可控。
+                    ramp_dur=$(awk -v f="$ramp_from" -v t="$speed" -v a="$ramp_up" \
+                        'BEGIN{ s = t - f; if (s < 0) s = -s
+                                r = 255 / a
+                                d = int(s / r); if (d < 2) d = 2
+                                printf "%d", d }')
+                    # start 是**反推合成值**，不是真实起点时刻。
+                    # 控制器按 remain = start + dur - now 计算剩余秒数，
+                    # 令其正好等于「从当前位置按斜率还要走多久」= (1 - 已完成比例) × dur，
+                    # 于是页面进度条按 PWM 实际位置推进，剩余秒数也准确。
+                    ramp_start=$(awk -v n="$now_s" -v f="$ramp_from" -v c="$cur_speed" -v t="$speed" -v dd="$ramp_dur" \
+                        'BEGIN{ s = t - f; if (s < 0) s = -s
+                                if (s == 0) { printf "%d", n; exit }
+                                done = (c - f) / (t - f)
+                                if (done < 0) done = 0; if (done > 1) done = 1
+                                printf "%d", n - int(done * dd) }')
                 fi
-                elapsed=$(( now_s - ramp_start ))
-                [ "$elapsed" -lt 0 ] && elapsed=0
-                # 线性插值：走完本段量程耗时 ramp_dur 秒
-                cur_speed=$(awk -v f="$ramp_from" -v t="$ramp_to" -v e="$elapsed" -v d="$ramp_dur" \
-                    'BEGIN{ if (d <= 0) { printf "%d", t; exit }
-                            v = f + (t - f) * e / d;
-                            if (t > f) { if (v > t) v = t } else { if (v < t) v = t }
-                            printf "%d", v }')
             else
                 # 已到位：清空渐入状态，恢复正常轮询
                 cur_speed=$speed
@@ -625,27 +722,6 @@ while true; do
                 ramp_to=-1
                 ramp_start=0
                 ramp_dur=0
-            fi
-            # 【关键】渐入期间保持 1 秒节拍，直到整段走完。
-            # 旧版把「缩短节拍」塞在「插值未命中目标」分支里，导致某轮插值恰好
-            # 等于目标（小改动时第一轮就会发生）后立刻退回 $interval 秒轮询，
-            # 后面几十秒都不再更新，页面看起来就是「卡住不动」。
-            #
-            # 为什么仍是 1 秒、不做到 250ms：
-            # 这台固件把所有亚秒等待手段都裁掉了 —— `sleep 0.25` 报
-            # "invalid number"、`read -t 0.25` 报 "invalid timeout"、没有 usleep
-            # applet。用忙等硬凑 250ms 实测要吃掉 4 jiffies(40ms) ≈ 16% 单核，
-            # 得不偿失。而且 PWM 是驱动风扇的物理量，本来就带惯性，
-            # 1 秒一档已经足够平滑；页面侧的 250ms 快档负责把进度条画连贯。
-            if [ "$ramp_from" -ge 0 ] 2>/dev/null; then
-                # 到点落定：避免浮点插值长期停在目标前一格、渐入状态迟迟不退
-                if [ "$(awk -v e="$elapsed" -v d="$ramp_dur" 'BEGIN{ printf (e >= d) ? 1 : 0 }')" = "1" ]; then
-                    cur_speed=$speed
-                    ramp_from=-1
-                    ramp_to=-1
-                    ramp_start=0
-                    ramp_dur=0
-                fi
             fi
         else
             # ramp_up=0（关闭渐入）或参数非法：直接到位
@@ -675,8 +751,8 @@ while true; do
     mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
 
     # 落盘渐入/守护状态，供 daemon 重启（含保存热重载）后接着跑
-    printf 'cur_speed=%s\nguard_active=%s\nramp_from=%s\nramp_to=%s\nramp_start=%s\n' \
-        "$cur_speed" "$guard_active" "$ramp_from" "$ramp_to" "$ramp_start" > "$STATE_FILE" 2>/dev/null
+    printf 'cur_speed=%s\nguard_active=%s\nramp_from=%s\nramp_to=%s\nramp_start=%s\ntemp_ema=%s\n' \
+        "$cur_speed" "$guard_active" "$ramp_from" "$ramp_to" "$ramp_start" "$temp_ema" > "$STATE_FILE" 2>/dev/null
 
     # 渐入进度单独落盘：页面每次采样都能拿到准确的起止时刻与总时长，
     # 不用靠轮询采样去反推（刷新间隔远大于 1 秒，反推必然不准）。
