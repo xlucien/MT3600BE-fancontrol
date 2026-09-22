@@ -370,32 +370,56 @@ esac
 : > "$HISTORY_FILE"
 
 while true; do
-    # 每轮重新读取配置，改动无需重启服务即可生效
-    mode=$(get_config mode auto)
-    manual_speed=$(get_config manual_speed 128)
-    auto_temp_low=$(get_config auto_temp_low 50)
-    auto_temp_mid=$(get_config auto_temp_mid 60)
-    auto_temp_high=$(get_config auto_temp_high 75)
-    auto_pwm_low=$(get_config auto_pwm_low 50)
-    auto_pwm_mid=$(get_config auto_pwm_mid 128)
-    auto_pwm_high=$(get_config auto_pwm_high 255)
-    min_temp=$(get_config min_temp 40)
-    max_temp=$(get_config max_temp 70)
-    min_speed=$(get_config min_speed 50)
-    max_speed=$(get_config max_speed 255)
-    night_enabled=$(get_config night_enabled 0)
-    night_start=$(get_config night_start 23:00)
-    night_end=$(get_config night_end 07:00)
-    night_speed=$(get_config night_speed 0)
-    guard_enabled=$(get_config guard_enabled 1)
-    guard_temp=$(get_config guard_temp 90)
-    guard_exit=$(get_config guard_exit 80)
-    guard_speed=$(get_config guard_speed 178)
-    ramp_up=$(get_config ramp_up 30)
-    # 控制温度的平滑窗口（秒）。0 = 关闭平滑。
-    # 默认 5 秒：MT798x 传感器噪声约 ±1.9°C，经曲线增益放大后会让目标每秒都变，
-    # 不做平滑的话 PWM 会持续摆动（详见下方「控制温度指数平滑」注释）。
-    temp_smooth=$(get_config temp_smooth 5)
+    # ---- 配置读取（带缓存）----
+    #
+    # 每轮无条件重读 22 项配置的话，就是每轮 22 次 fork+exec uci 进程 —— 这是本
+    # 守护进程开销的大头（实测 1.5 秒一轮，约 27 次 fork/秒）。但配置几乎从不变，
+    # 所以改成只在下面三种情况才真读：
+    #   ① 首次进入循环
+    #   ② 出现 /tmp/fancontrol_reload（页面点「保存并生效」时写入）→ 1 秒内生效
+    #   ③ 兜底周期 CFG_REFRESH 秒 → 覆盖 ssh 里直接 uci set 这类没写标志文件的场景
+    # 对外行为不变：改动依然无需重启服务。
+    now_s=$(date +%s)
+    cfg_dirty=0
+    if [ -z "$CFG_LOADED_AT" ]; then
+        cfg_dirty=1
+    elif [ -e /tmp/fancontrol_reload ]; then
+        rm -f /tmp/fancontrol_reload
+        cfg_dirty=1
+    elif [ $(( now_s - CFG_LOADED_AT )) -ge "${CFG_REFRESH:-5}" ]; then
+        cfg_dirty=1
+    fi
+
+    if [ "$cfg_dirty" = "1" ]; then
+        mode=$(get_config mode auto)
+        manual_speed=$(get_config manual_speed 128)
+        auto_temp_low=$(get_config auto_temp_low 50)
+        auto_temp_mid=$(get_config auto_temp_mid 60)
+        auto_temp_high=$(get_config auto_temp_high 75)
+        auto_pwm_low=$(get_config auto_pwm_low 50)
+        auto_pwm_mid=$(get_config auto_pwm_mid 128)
+        auto_pwm_high=$(get_config auto_pwm_high 255)
+        min_temp=$(get_config min_temp 40)
+        max_temp=$(get_config max_temp 70)
+        min_speed=$(get_config min_speed 50)
+        max_speed=$(get_config max_speed 255)
+        night_enabled=$(get_config night_enabled 0)
+        night_start=$(get_config night_start 23:00)
+        night_end=$(get_config night_end 07:00)
+        night_speed=$(get_config night_speed 0)
+        guard_enabled=$(get_config guard_enabled 1)
+        guard_temp=$(get_config guard_temp 90)
+        guard_exit=$(get_config guard_exit 80)
+        guard_speed=$(get_config guard_speed 178)
+        ramp_up=$(get_config ramp_up 30)
+        # 控制温度的平滑窗口（秒）。0 = 关闭平滑。
+        # 默认 5 秒：MT798x 传感器噪声约 ±1.9°C，经曲线增益放大后会让目标每秒都变，
+        # 不做平滑的话 PWM 会持续摆动（详见下方「控制温度指数平滑」注释）。
+        temp_smooth=$(get_config temp_smooth 5)
+        # 历史长度也放进缓存块，这样改了不必重启服务才生效
+        history_size=$(get_config history_size 60)
+        CFG_LOADED_AT=$now_s
+    fi
     # 守护状态跨轮保持（触发温度与退出温度之间的区间保持原状，避免抖动）
     # 优先从状态文件恢复，保证 daemon 重启后闭锁状态不丢
     if [ -r "$STATE_FILE" ]; then
@@ -505,15 +529,9 @@ while true; do
             [ "$speed" -lt 0 ] && speed=0
             [ "$speed" -gt 255 ] && speed=255
             target_speed=$speed
-            set_manual_control
-            if [ -n "$PWM_CONTROL" ] && [ -e "$PWM_CONTROL" ]; then
-                echo "$speed" > "$PWM_CONTROL" 2>/dev/null
-            else
-                PWM_CONTROL="$(pwm_path)"
-                if [ -n "$PWM_CONTROL" ] && [ -e "$PWM_CONTROL" ]; then
-                    echo "$speed" > "$PWM_CONTROL" 2>/dev/null
-                fi
-            fi
+            # 这里不再写 PWM：此处能给的只是「目标值」，紧接着的渐入块会用
+            # 「渐入中的实际值」再写一次并覆盖它。留着只是每轮多一次 sysfs 写、
+            # 多一次 set_manual_control（它会遍历所有 thermal_zone 写 mode/policy）。
             ;;
         auto_curve)
             # 自动曲线：线性插值
@@ -529,30 +547,14 @@ while true; do
             [ "$speed" -lt 0 ] && speed=0
             [ "$speed" -gt 255 ] && speed=255
             target_speed=$speed
-            set_manual_control
-            if [ -n "$PWM_CONTROL" ] && [ -e "$PWM_CONTROL" ]; then
-                echo "$speed" > "$PWM_CONTROL" 2>/dev/null
-            else
-                PWM_CONTROL="$(pwm_path)"
-                if [ -n "$PWM_CONTROL" ] && [ -e "$PWM_CONTROL" ]; then
-                    echo "$speed" > "$PWM_CONTROL" 2>/dev/null
-                fi
-            fi
+            # 不写 PWM，理由同 auto 分支
             ;;
         manual)
             speed=$manual_speed
             [ "$speed" -lt 0 ] && speed=0
             [ "$speed" -gt 255 ] && speed=255
             target_speed=$speed
-            set_manual_control
-            if [ -n "$PWM_CONTROL" ] && [ -e "$PWM_CONTROL" ]; then
-                echo "$speed" > "$PWM_CONTROL" 2>/dev/null
-            else
-                PWM_CONTROL="$(pwm_path)"
-                if [ -n "$PWM_CONTROL" ] && [ -e "$PWM_CONTROL" ]; then
-                    echo "$speed" > "$PWM_CONTROL" 2>/dev/null
-                fi
-            fi
+            # 不写 PWM，理由同 auto 分支
             ;;
     esac
 
@@ -635,7 +637,7 @@ while true; do
         # 页面显示的「约 N 秒到位」也会明显偏短。改成按真实 dt 折算后，
         # 斜率恒等于 255/ramp_up，与循环开销解耦，剩余秒数也准了。
         # dt 上限 5 秒：万一 daemon 被挂起过久，也不至于一拍跳完全程。
-        now_s=$(date +%s)
+        # now_s 复用循环开头取到的时间戳，同一轮内差不到 1 秒，够用且省一次 fork。
         dt=$interval
         if [ -n "$last_tick_s" ]; then
             dt=$(( now_s - last_tick_s ))
@@ -733,22 +735,48 @@ while true; do
         fi
         speed=$cur_speed
 
-        set_manual_control
-        if [ -n "$PWM_CONTROL" ] && [ -e "$PWM_CONTROL" ]; then
-            echo "$speed" > "$PWM_CONTROL" 2>/dev/null
-        else
-            PWM_CONTROL="$(pwm_path)"
+        # ---- 接管设置 + 写 PWM（节流 + 去重）----
+        #
+        # set_manual_control 会遍历所有 thermal_zone 写 mode/policy、再写 pwm_enable。
+        # 每轮都做纯属浪费（值根本没变），但也不能完全不做：内核或其他进程有可能
+        # 把它们改回去。折中：运行模式切换时立刻做一次，另外每 30 秒兜底做一次。
+        force_hw=0
+        if [ -z "$last_ctl_at" ] || [ "$mode" != "$last_ctl_mode" ] \
+           || [ $(( now_s - last_ctl_at )) -ge 30 ]; then
+            set_manual_control
+            last_ctl_mode=$mode
+            last_ctl_at=$now_s
+            force_hw=1
+        fi
+
+        # PWM 值没变就不写：稳态下每轮都能省掉一次 sysfs 写。
+        # force_hw 时强制补写一次，兜住「被别人改写过」的情况。
+        if [ "$speed" != "$last_pwm_written" ] || [ "$force_hw" = "1" ]; then
             if [ -n "$PWM_CONTROL" ] && [ -e "$PWM_CONTROL" ]; then
                 echo "$speed" > "$PWM_CONTROL" 2>/dev/null
+            else
+                PWM_CONTROL="$(pwm_path)"
+                if [ -n "$PWM_CONTROL" ] && [ -e "$PWM_CONTROL" ]; then
+                    echo "$speed" > "$PWM_CONTROL" 2>/dev/null
+                fi
             fi
+            last_pwm_written=$speed
         fi
     fi
 
-    ts=$(date +%s)
-    echo "$ts,$control_temp_c,$cpu_temp_c,$wifi0_temp_c,$wifi1_temp_c,$eth_temp_c,$speed,$mode,$fan_rpm,$reason,$in_night,$guard_active,$target_speed" >> "$HISTORY_FILE"
+    # 时间戳复用循环开头那个 now_s，省两次 date 的 fork
+    echo "$now_s,$control_temp_c,$cpu_temp_c,$wifi0_temp_c,$wifi1_temp_c,$eth_temp_c,$speed,$mode,$fan_rpm,$reason,$in_night,$guard_active,$target_speed" >> "$HISTORY_FILE"
 
-    tail -n "$history_size" "$HISTORY_FILE" > "${HISTORY_FILE}.tmp"
-    mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
+    # 历史裁剪节流：每轮 tail + mv 会把整个文件重写一遍，稳态下毫无必要。
+    # 攒到 history_size + 30 行再裁一次；多出来的几十行不影响展示 ——
+    # 页面本来就只取末尾 N 条来画图。
+    hist_limit=$(( ${history_size:-60} + 30 ))
+    hist_n=$(( ${hist_n:-0} + 1 ))
+    if [ "$hist_n" -ge "$hist_limit" ]; then
+        tail -n "${history_size:-60}" "$HISTORY_FILE" > "${HISTORY_FILE}.tmp"
+        mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
+        hist_n=${history_size:-60}
+    fi
 
     # 落盘渐入/守护状态，供 daemon 重启（含保存热重载）后接着跑
     printf 'cur_speed=%s\nguard_active=%s\nramp_from=%s\nramp_to=%s\nramp_start=%s\ntemp_ema=%s\n' \
@@ -756,7 +784,7 @@ while true; do
 
     # 渐入进度单独落盘：页面每次采样都能拿到准确的起止时刻与总时长，
     # 不用靠轮询采样去反推（刷新间隔远大于 1 秒，反推必然不准）。
-    now_stamp=$(date +%s)
+    now_stamp=$now_s
     if [ "$ramp_from" -ge 0 ] 2>/dev/null; then
         printf 'active=1\nfrom=%s\nto=%s\nstart=%s\ndur=%s\nnow=%s\n' \
             "$ramp_from" "$ramp_to" "$ramp_start" "$ramp_dur" "$now_stamp" > "$RAMP_FILE" 2>/dev/null
