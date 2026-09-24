@@ -1,0 +1,28 @@
+{
+	"admin/system/fancontrol": {
+		"title": "风扇控制",
+		"order": 60,
+	"action": {
+		"type": "template",
+		"path": "fancontrol"
+	}
+},
+
+	"admin/system/fancontrol/data": {
+		"action": {
+			"type": "function",
+			"module": "luci.controller.admin.system.fancontrol",
+			"function": "action_data"
+		},
+		"auth": {}
+	},
+
+	"admin/system/fancontrol/save": {
+		"action": {
+			"type": "function",
+			"module": "luci.controller.admin.system.fancontrol",
+			"function": "action_save"
+		},
+		"auth": {}
+	}
+}
