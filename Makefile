@@ -10,7 +10,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-fancontrol
-PKG_VERSION:=3.17
+PKG_VERSION:=3.18
 PKG_RELEASE:=1
 
 PKG_LICENSE:=MIT
@@ -19,7 +19,7 @@ PKG_MAINTAINER:=Louis
 LUCI_TITLE:=Fan Control for GL.iNet GL-MT3600BE
 LUCI_DESCRIPTION:=PWM fan control with auto/curve/manual modes, night quiet window, \
 	thermal guard with hysteresis, and time-scaled soft ramp. \
-	Uses ucode controller + template (LuCI theme chrome included).
+	ucode controller + template, LuCI theme chrome included; no Lua required.
 LUCI_DEPENDS:=+luci-base
 LUCI_PKGARCH:=all
 
