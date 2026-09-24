@@ -1,0 +1,1517 @@
+{% include('header') -%}
+{%
+	let defs = {mode: 'auto', manual_speed: 128, auto_temp_low: 50, auto_temp_mid: 60, auto_temp_high: 75,
+	            auto_pwm_low: 50, auto_pwm_mid: 128, auto_pwm_high: 255,
+	            min_temp: 40, max_temp: 70, min_speed: 50, max_speed: 255, interval: 1,
+	            night_enabled: 0, night_start: '23:00', night_end: '07:00', night_speed: 0, ramp_up: 30,
+	            guard_enabled: 1, guard_temp: 90, guard_exit: 80, guard_speed: 178};
+	let jarr = [];
+	for (let k, d in defs) {
+		let v = uci.get('fancontrol', 'main', k);
+		if (typeof(d) == 'string') {
+			let s = (v == null || v == '') ? d : v;
+			let esc = replace(replace(replace(replace('' + s, /\\/g, '\\\\'), /"/g, '\\"'), /\n/g, '\\n'), /\r/g, '\\r');
+			push(jarr, k + ':"' + esc + '"');
+		}
+		else {
+			let n = +v;
+			push(jarr, k + ':' + (n != n || v == null ? d : n));
+		}
+	}
+-%}
+<style>
+    #fc { --bg:#f4f6f9; --card:#ffffff; --line:#e8ecf2; --text:#1c2333; --muted:#8a94a6;
+          --brand:#2e7bf0; --brand-soft:#eaf2ff; --ok:#22a45d; --ok-soft:#e8f7ee;
+          --warn:#f59e0b; --hot:#ef4444;
+          font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",Roboto,sans-serif;
+          background:var(--bg); color:var(--text); padding:16px; line-height:1.5;
+          -webkit-font-smoothing:antialiased; }
+    #fc * { box-sizing:border-box; }
+    #fc .wrap { max-width:1120px; margin:0 auto; }
+
+    #fc .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+                padding:16px 18px; margin-bottom:14px; }
+    #fc .card-h { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px; }
+    #fc .card-t { font-size:14.5px; font-weight:650; }
+    #fc .card-s { font-size:12px; color:var(--muted); }
+
+    #fc .st-card { display:flex; gap:20px; }
+    @media (max-width:760px){ #fc .st-card { flex-direction:column; } }
+    #fc .fan-visual { flex:none; width:186px; display:flex; flex-direction:column; align-items:center; gap:10px; }
+    /* 曲线图并入风扇列：与风扇图标同列，置于其下方 */
+    #fc .fan-curve { width:100%; align-self:stretch; margin-top:2px;
+                     border-top:1px dashed var(--line); padding-top:10px; }
+    #fc .fan-curve .fc-h { text-align:center; margin-bottom:4px; }
+    #fc .fan-curve .fc-t { font-size:12px; font-weight:600; color:var(--muted); }
+    #fc .fan-curve svg { width:100%; height:auto; display:block; }
+    #fc .fan-curve .hint { font-size:11px; line-height:1.5; text-align:center; margin-top:6px; }
+    #fc .fan-ring { width:116px; height:116px; border-radius:50%; background:#eaf2fd;
+                    display:flex; align-items:center; justify-content:center; transition:background .3s; }
+    /* 转子旋转由 JS 的 rAF 按角速度积分驱动（见脚本里的 fanSpin）。
+       【为什么不再用 CSS animation】
+       原来是 animation:fc-spin + 每轮改 --fan-dur（animation-duration）来变速。
+       改 animation-duration 虽然不会"重启"动画，但浏览器会用**新时长**去重新
+       解释已经流逝的时间，角度瞬间跳变：PWM 每变 1 约跳 1.7°，而升速中 PWM
+       一次跳 8~17 很常见，那时能跳 20° —— 用户看到的就是"一顿一顿"。
+       改成积分后，速度变化只改角速度、角度本身连续，不会跳。 */
+    /* transform-box 必须显式写 view-box：
+       转子的旋转中心要落在这个 SVG 的 viewBox 坐标 (36,36) 上，
+       而不是元素自身包围盒的某个百分比位置（默认行为在不同浏览器上不一致，
+       而且 5 叶扇形的包围盒中心本来就不等于旋转中心，靠它会偏）。
+       旋转由 JS 写 style.transform=rotate(Ndeg) 驱动，详见脚本里的 fanSpin。
+       【别改用 SVG 的 transform="rotate(a 36 36)" 属性】
+       试过，会和这里的 transform-origin 叠加成一次带轴的三维旋转，
+       转子被甩出 SVG 范围 —— 表现为「扇叶不居中」。 */
+    #fc .fan-rotor { transform-box:view-box; transform-origin:36px 36px; will-change:transform; }
+    #fc .stopped .fan-ring { background:#f1f3f7; }
+    #fc .stopped .blade { fill:#c3cad6; }
+    #fc .stopped .hub { fill:#aeb7c4; }
+
+    /* 高速彩虹：PWM 超过 80% 时扇叶变彩虹色（红橙黄绿蓝各一片）。
+       视觉上直接告诉你「风扇正在高速跑」，比看数字更直观。
+       - 用 nth-of-type 定位：五片叶是 .fan-rotor 里连续排列的 5 个 <path>，
+         顺序稳定；轮毂是 <circle>，不会被算进来。
+       - fill 是 SVG 的呈现属性，CSS 能覆盖它 —— 上面 .stopped .blade
+         就是这么做的，这里同理。
+       - 加 transition 让切换是渐变而不是硬跳。
+       阈值见脚本里的 RAINBOW_PCT。 */
+    #fc .blade, #fc .hub { transition:fill .5s ease; }
+    #fc .rainbow .blade:nth-of-type(1) { fill:#e8453c; }
+    #fc .rainbow .blade:nth-of-type(2) { fill:#f0913c; }
+    #fc .rainbow .blade:nth-of-type(3) { fill:#e8c53c; }
+    #fc .rainbow .blade:nth-of-type(4) { fill:#4aa564; }
+    #fc .rainbow .blade:nth-of-type(5) { fill:#4a8af4; }
+    /* 轮毂转中性灰，让五片彩叶更跳出来 */
+    #fc .rainbow .hub { fill:#6b7688; }
+    /* @keyframes fc-spin 已随转子改用 rAF 积分而删除（不再有 CSS 动画引用它）。
+       若哪天要退回 CSS 动画方案，记得把它加回来。 */
+
+    #fc .pill { display:inline-flex; align-items:center; gap:6px; padding:3px 11px; border-radius:999px;
+                font-size:12px; font-weight:600; }
+    #fc .pill i { width:7px; height:7px; border-radius:50%; background:currentColor; }
+    #fc .pill.run { background:var(--ok-soft); color:var(--ok); }
+    #fc .pill.stop { background:#f1f3f7; color:var(--muted); }
+
+    #fc .st-main { flex:1; min-width:0; }
+    #fc .st-mono { font-family:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace; font-size:12px;
+                   color:#5b6b83; background:#f7f9fc; border:1px solid var(--line); border-radius:8px;
+                   padding:6px 12px; margin-bottom:12px; white-space:nowrap; overflow-x:auto; }
+    /* 状态卡栅格：写死 4 列，不用 auto-fit。
+       这条链修过两轮，把两次的坑都记下来，别再踩第三次：
+
+       【第一轮】原来写 repeat(auto-fit, minmax(110px, 1fr))。
+         - minmax 的第一个参数 110px 只是「轨道下限」，不是上限。格子里一旦
+           有不换行的长文字（渐入提示「保存后 手动渐入 50% → 100%」自然宽
+           146.6px），内容的 min-content 就会把轨道顶开，进而把卡片和外层
+           栅格一起顶宽 → 用户看到「切渐入时页面宽度变了」。
+         - 同时栅格子项默认 min-width:auto，也允许内容反推轨道宽度。
+
+       【第二轮】当时把下限改成 0（minmax(0,1fr)），想当然以为「下限归零就
+       不会被顶宽」。实测证明这个更糟：auto-fit 在下限为 0 时会疯狂铺列 ——
+       900px 容器下算出了 82 个轨道，其中 78 个是塌缩成 0px 的「幽灵列」，
+       而它们的 gap 也照样参与布局。幽灵列数量对亚像素级变化极其敏感，
+       列数一抖整行就重排，反而让宽度更不稳定。实测数据：
+         minmax(0,1fr)   → 82 列（78 个 0px 幽灵列）
+         minmax(110px,1fr) →  7 列（ 3 个 0px 幽灵列）
+         repeat(4,minmax(0,1fr)) → 4 列，轨道干净
+
+       【现在的写法】状态卡就是固定 4 格，没有「自适应列数」的需求，
+       所以直接写死 repeat(4, minmax(0,1fr))：
+         - 列数恒定 → 不存在列数抖动，宽度天然稳定；
+         - 下限 0 保留 → 轨道严格等于「可用宽度 ÷ 4」，内容无权干预；
+         - 配合 .tile 的 min-width:0 与 .jp-t 的绝对定位，这条传导链彻底断开。
+
+       注意：若将来状态卡格子数变了，这里的 4 要跟着改。 */
+    #fc .tiles { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+    /* 窄屏降为 2 列：4 列时每格只剩约 113px，「62.2 °C」勉强放得下，
+       但余量太小容易和单位挤在一起。降到 2 列每格约 340px，读数舒展。
+       这里同样写死列数（不用 auto-fit），理由见上面那段注释。 */
+    @media (max-width:640px){ #fc .tiles { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+    /* padding-bottom:25px 是给渐入提示文字预留的**常驻**空间，四个格子永远同高。
+       早期版本只在渐入时由 JS 加 .has-jp 临时撑高，导致 PWM 格 63.5→88.5px、
+       整张状态卡 407.5→429.75px，下方内容整体下移 22px，渐入结束又缩回去。
+       改成常驻后，文字只是在预留空白里显隐，对布局零影响。 */
+    #fc .tile { background:#f7f9fc; border:1px solid var(--line); border-radius:9px;
+                padding:9px 12px 25px; min-width:0; position:relative; }
+    #fc .tile span { display:block; font-size:11px; color:var(--muted); }
+    #fc .tile b { font-size:18px; font-weight:650; font-variant-numeric:tabular-nums; }
+    #fc .tile small { font-size:11px; color:var(--muted); font-weight:500; margin-left:2px; }
+    /* PWM 格内的渐入进度条：实时显示「已到 x% ／ 目标 y%」的追赶进度 */
+    #fc .tile.ramping { background:#fffbf4; border-color:#f3ddb0; }
+    /* 渐入进度条：同样绝对定位，放进 .tile 底部预留的带里。
+       它以前是流内元素（margin-top:6px + height:3px = 9px），
+       display:none ↔ 显示之间会让 PWM 格高度跳 9px —— 这是高度抖动的最后一环。
+       绝对定位后，进度条与提示文字共用同一条预留带，显隐都不影响高度。
+
+       预留带的自下而上布局（.tile padding-bottom:25px，内容区底线为 0）：
+         bottom 8    文字行（line-height 13）→ 占 8..21
+         bottom 22   进度条（height 3）      → 占 22..25
+       两者留 1px 间隙，互不重叠。 */
+    #fc .jp { position:absolute; left:12px; right:12px; bottom:22px;
+              height:3px; border-radius:2px; background:#e8ecf3; overflow:hidden; }
+    #fc .jp > i { display:block; height:100%; width:0; border-radius:2px;
+                  background:linear-gradient(90deg,#f0a83c,#ef7f2c);
+                  transition:width .5s linear; }
+    /* 渐入提示文字：绝对定位，完全不参与横向宽度计算。
+       原先是普通流内元素 + white-space:nowrap，文字一长就把 PWM 格顶宽，
+       连带整张状态卡和页面栅格一起变宽（用户看到的就是「页面宽度会变」）。
+       改成绝对定位后：
+         - 宽度不再是布局因素，多长都不影响卡片尺寸；
+         - 文字被限制在格子宽度内并居中，超长时以省略号收尾（ellipsis），
+           既不会溢出到相邻格子，也不会挤压上面的 PWM 数值。
+
+       【关键】预留空间必须**常驻**，不能只在渐入时才加。
+       曾经写成 .tile.has-jp{padding-bottom:25px} 由 JS 在渐入开始时添加，
+       后果是渐入期间 PWM 格从 63.5px 长到 88.5px、整张状态卡从 407.5px
+       长到 429.75px，下方保存栏以下所有内容整体下移 22px，
+       渐入结束又缩回去 —— 用户看到的就是「高度还是会变化」。
+       现在把 padding-bottom 直接写在 .tile 本体上（见上面 .tile 规则），
+       四个状态格永远同高，渐入文字只是「在被预留的空白里显隐」，对布局零影响。 */
+    #fc .jp-t { position:absolute; left:12px; right:12px; bottom:8px;
+                font-size:10.5px; line-height:13px; color:var(--warn);
+                white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+                text-align:center; font-variant-numeric:tabular-nums; }
+
+    #fc .src-row { display:flex; gap:14px; flex-wrap:wrap; margin-top:10px; font-size:12px; color:var(--muted); }
+    #fc .src-row b { color:var(--text); font-weight:600; }
+
+    /* 服务状态行已从界面移除，样式保留无害（JS 侧为守卫式取值） */
+    #fc .svc-rows { margin-top:12px; border-top:1px dashed var(--line); padding-top:10px; }
+    #fc .svc-row { display:flex; align-items:center; justify-content:space-between; padding:4px 0; font-size:13px; }
+    #fc .svc-row .l { display:flex; align-items:center; gap:8px; }
+    #fc .dot { width:8px; height:8px; border-radius:50%; flex:none; }
+    #fc .dot.g { background:var(--ok); box-shadow:0 0 0 3px var(--ok-soft); }
+    #fc .dot.o { background:var(--warn); box-shadow:0 0 0 3px #fdf1dc; }
+    #fc .dot.r { background:var(--hot); box-shadow:0 0 0 3px #fdecec; }
+    #fc .svc-row .r { font-size:12px; color:var(--muted); }
+
+    /* 分段控件：浅灰凹槽，选中项 = 白色浮起小块（不是蓝色实心）。
+       【别再加回那圈深色细环】原来选中项除了投影还叠了一层
+       0 0 0 .5px rgba(16,24,40,.04)，用户看着就像按键旁边有个黑框，
+       已按反馈去掉 —— 只保留柔投影就够了。 */
+    #fc .seg { display:inline-flex; background:#f2f4f8; border-radius:10px; padding:3px; gap:2px; flex-wrap:wrap; }
+    #fc .seg button { border:0; background:transparent; padding:7px 18px; border-radius:8px;
+                      font-size:13px; font-weight:600; color:#7c8698; cursor:pointer; transition:all .15s; }
+    #fc .seg button:hover:not(.active) { color:var(--text); }
+    #fc .seg button.active { background:#fff; color:var(--text); box-shadow:0 1px 3px rgba(16,24,40,.08); }
+
+    #fc .panel { display:none; }
+    #fc .panel.show { display:block; }
+    #fc .row { display:flex; justify-content:space-between; align-items:center; gap:12px;
+               padding:10px 2px; border-bottom:1px dashed #eef1f6; }
+    #fc .row:last-child { border-bottom:0; }
+    #fc .lb { font-size:13.5px; font-weight:600; }
+    #fc .sub { font-size:11.5px; color:var(--muted); margin-top:2px; }
+    /* 步进器：减号 / 数值 / 加号 三段并排。
+       曾经给三段各加 1px 边框，但浅色底上那圈线看着像「黑框」太重，
+       改成**不用描边**、以浅灰底 + 白底区分层次 —— 结构照样看得清，视觉更轻。
+
+       圆角取值：三者统一 8px，与 .chip / .seg button 同值（页面「小号控件」基准）。 */
+    #fc .step { display:inline-flex; align-items:center; flex:none; gap:6px; }
+    /* 减/加按钮：浅灰底，无描边 */
+    #fc .step button { width:29px; height:29px; flex:none;
+                       border:0; border-radius:8px;
+                       background:#f2f4f8;
+                       font-size:15px; line-height:1; cursor:pointer; color:#8792a4;
+                       display:flex; align-items:center; justify-content:center;
+                       transition:background .14s, color .14s; }
+    #fc .step button:hover { background:#e6edfb; color:var(--brand); }
+    #fc .step button:active { background:#d8e5fa; }
+    /* 数值框：白底 + 极浅投影，与灰底按钮形成层次（不用描边） */
+    #fc .step .vwrap { display:flex; align-items:center; justify-content:center;
+                       height:29px; padding:0 8px 0 2px; gap:1px;
+                       border:0; border-radius:8px;
+                       background:#fff;
+                       box-shadow:0 1px 2px rgba(16,24,40,.06); }
+    #fc .step input.v { width:38px; border:0; outline:0; background:transparent; text-align:right;
+                        font-size:13.5px; font-weight:650; color:var(--text);
+                        font-variant-numeric:tabular-nums; padding:0; }
+    #fc .step input.v::-webkit-outer-spin-button,
+    #fc .step input.v::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
+    #fc .step input.v[type=number] { -moz-appearance:textfield; }
+    /* 聚焦 / 报错都作用在「数值框」这层（它是白底那块）。
+       聚焦用柔和光晕而非硬边线，报错才用浅红底提示。 */
+    #fc .step .vwrap:focus-within { background:#f5f9ff; box-shadow:0 0 0 3px #e5eeff; }
+    #fc .step .vwrap.is-err { background:#fdecec; box-shadow:none; }
+    #fc .step .u { font-size:12px; color:var(--muted); white-space:nowrap; }
+    #fc .step input.v.err { color:var(--hot); }
+    #fc .hint { font-size:12px; color:var(--muted); margin-top:10px; }
+
+    #fc .mp-num { font-size:34px; font-weight:700; color:var(--brand); font-variant-numeric:tabular-nums;
+                   width:88px; text-align:right; border:0; border-bottom:1px dashed var(--line);
+                   background:transparent; outline:0; padding:0 2px; }
+    #fc .mp-num:focus { border-bottom-color:var(--brand); border-bottom-style:solid; }
+    #fc .mp-num::-webkit-outer-spin-button,
+    #fc .mp-num::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
+    #fc .mp-num[type=number] { -moz-appearance:textfield; }
+    #fc .mp-cap { font-size:12px; color:var(--muted); margin-top:6px; }
+    /* 【手动 PWM 并排布局】数值输入与滑条左右并排，替代原来的「数值在上、滑条在下」。
+       用 grid 而非 flex，是为了让「数字／%」与「滑条」两列有稳定宽度，
+       不会因数字位数变化（0 ↔ 100）导致滑条左右抖动。
+       - 第一列固定宽 104px（34px 字号下 3 位数 + 百分号刚好放得下）
+       - 第二列 minmax(0,1fr) 吃掉剩余宽度并允许收缩（防溢出）
+       - align-items:center 让数字基线与滑条中线对齐 */
+    #fc .mp-line { display:grid; grid-template-columns:104px minmax(0,1fr);
+                   align-items:center; gap:14px; }
+    #fc .mp-line .mp-val { display:flex; align-items:baseline; justify-content:flex-end; }
+    #fc .mp-line .mp-unit { color:var(--muted); font-size:13px; margin-left:2px; }
+    /* 滑条基础样式：轨道 + 已填充部分用渐变表现（--fill 由 JS 写）。
+       并排后垂直外边距归零，改由 .mp-line 的 align-items 居中。 */
+    #fc input[type=range] { -webkit-appearance:none; appearance:none; width:100%; height:6px;
+                            border-radius:999px; outline:0; margin:0;
+                            background:linear-gradient(90deg,var(--brand) var(--fill,50%),#e3e9f2 var(--fill,50%)); }
+    #fc input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; appearance:none; width:18px; height:18px;
+                            border-radius:50%; background:#fff; border:2px solid var(--brand); cursor:pointer;
+                            box-shadow:0 2px 6px rgba(16,24,40,.2); }
+    #fc input[type=range]::-moz-range-thumb { width:16px; height:16px; border-radius:50%; background:#fff;
+                            border:2px solid var(--brand); cursor:pointer; }
+    /* 档位胶囊：放进一条浅灰凹槽里，与分段控件 / 时间输入同一套「槽 + 白块」语言。
+       【4 个键】原本是 5 个（含「超静音 20%」），用户要求去掉超静音档，
+       所以 grid-template-columns 必须同步改成 repeat(4, ...)，
+       否则会空出一格、剩下的键被挤窄。
+       四个键等宽平分，不再用 flex-wrap 参差换行。
+       标签拆成「档名 + 百分比」两行——"超静音 20%" 这种长短不一的写法
+       会让等宽格子里的按钮宽窄失衡。做成上档名下数值后，四个格子完全对齐。
+
+       【钢琴键式】五个键连成一排、共边，像钢琴的白键：
+         - 键与键之间只用 1px 缝隙，缝隙透出容器底色当分隔线（不再各自 gap 4px）；
+         - 圆角只留整体一圈，靠容器 overflow:hidden 裁齐首尾，键本身是方角。
+
+       【外框与模式按键统一】外框直接照抄分段控件 .seg 的参数：
+       背景 #f2f4f8、圆角 10px、内边距 3px。两处都是「浅灰凹槽里放一排键」，
+       视觉重量一致后才像同一套组件。原来的 #e3e9f2 底色 + 1px 同色描边
+       偏重、偏冷，跟模式按键摆在一起明显不是一家，已去掉那圈描边。
+       停转（0%）是全页唯一的危险操作，保留红键 —— 在一排白键里它天然醒目，
+       又不会引入新的深色块（用户此前刚反馈过按键附近有"黑框"）。 */
+    #fc .chips { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr));
+                 gap:1px; margin-top:12px; padding:3px;
+                 background:#f2f4f8;                 /* 与 .seg 同色：1px 缝隙与 3px 内圈都透出它 */
+                 border-radius:10px; overflow:hidden; }
+    #fc .chip { display:flex; flex-direction:column; align-items:center; gap:1px;
+                border:0; background:#fff; border-radius:6px;
+                padding:8px 4px; font-size:12.5px; font-weight:600; color:var(--text);
+                cursor:pointer; transition:background .15s; line-height:1.25; }
+    #fc .chip b { font-weight:600; }
+    #fc .chip em { font-style:normal; font-size:11.5px; color:var(--muted); font-weight:600;
+                   font-variant-numeric:tabular-nums; }
+    /* 悬停：白键轻染品牌色即可。不再用白块浮起 + 深色细环 ——
+       键本来就是白的，浮起来没意义，细环正是用户要去掉的"黑框"。 */
+    #fc .chip:hover { background:#f2f7ff; }
+    #fc .chip:active { background:#e6eefb; }
+    /* 停转：一排白键里的红键。同样不再有外圈阴影/描边 */
+    #fc .chip.danger { background:#e8453c; color:#fff; }
+    #fc .chip.danger em { color:rgba(255,255,255,.82); }
+    #fc .chip.danger:hover { background:#d93b32; }
+    #fc .chip.danger:active { background:#c7332b; }
+
+    #fc canvas { width:100%; height:220px; display:block; }
+    #fc .legend { display:flex; gap:16px; font-size:12px; color:var(--muted); margin-top:8px; }
+    /* 图例：温度实线；PWM 是虚线，图例也画成虚线（图例即所见） */
+    #fc .legend i { display:inline-block; width:16px; height:0; vertical-align:middle; margin-right:6px;
+                    border-top-width:2.5px; border-top-style:solid; }
+    #fc .legend i.lg-t { border-top-color:#ef4444; }
+    #fc .legend i.lg-p { border-top-color:#2563eb; border-top-style:dashed;
+                         border-top-width:2.5px;
+                         box-shadow:0 0 0 2px rgba(37,99,235,.16); }
+
+    /* 合并进状态卡的历史曲线分区 */
+    #fc .st-hist { margin-top:12px; border-top:1px dashed var(--line); padding-top:10px; }
+    #fc .st-hist .hist-h { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:6px; }
+    #fc .st-hist canvas { height:170px; }
+
+
+
+    #fc .toast { position:fixed; left:50%; bottom:28px; transform:translateX(-50%) translateY(14px);
+                 background:#1c2333; color:#fff; padding:10px 18px; border-radius:10px; font-size:13px;
+                 opacity:0; pointer-events:none; transition:all .25s; z-index:9999; }
+    #fc .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+
+    #fc .sw { position:relative; display:inline-block; width:42px; height:22px; flex:none; }
+    #fc .sw input { opacity:0; width:0; height:0; position:absolute; }
+    #fc .sw-i { position:absolute; inset:0; background:#d7dde7; border-radius:999px; cursor:pointer; transition:background .2s; }
+    #fc .sw-i:before { content:""; position:absolute; width:18px; height:18px; left:2px; top:2px;
+                       background:#fff; border-radius:50%; transition:transform .2s; box-shadow:0 1px 3px rgba(16,24,40,.2); }
+    #fc .sw input:checked + .sw-i { background:var(--brand); }
+    #fc .sw input:checked + .sw-i:before { transform:translateX(20px); }
+    /* 时间输入：去掉硬边框，改浅灰底，整体轻一点 */
+    #fc input[type=time] { border:1px solid transparent; border-radius:9px; padding:6px 8px;
+                           font-family:inherit; font-size:13.5px; font-weight:600; color:var(--text);
+                           background:#f2f4f8; outline:0; transition:all .15s; }
+    #fc input[type=time]:hover { background:#eceff5; }
+    #fc input[type=time]:focus { background:#fff; border-color:var(--brand);
+                                 box-shadow:0 0 0 3px rgba(46,123,240,.14); }
+    #fc .timepair { display:flex; align-items:center; gap:6px; }
+    #fc .timepair .sep { color:var(--muted); }
+    #fc .sep-line { height:1px; background:var(--line); margin:14px 0; }
+    #fc .pill.guard { background:#fdecec; color:var(--hot); }
+    #fc .pill.night { background:#eef2ff; color:#4f5bd5; }
+    #fc .pill.ramp { background:#fdf1dc; color:var(--warn); }
+    #fc .pill i.spin { animation:fc-blink 1s ease-in-out infinite; }
+    @keyframes fc-blink { 50% { opacity:.3; } }
+
+    #fc .grid2 { display:grid; grid-template-columns:1fr 300px; gap:14px; align-items:start; }
+    @media (max-width:980px){ #fc .grid2 { grid-template-columns:1fr; } }
+
+    #fc .savebar { display:flex; align-items:center; justify-content:space-between; gap:12px;
+                   padding:12px 18px; flex-wrap:wrap; }
+    #fc .sb-left { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    #fc .sb-right { display:flex; gap:8px; }
+    /* 按钮：更圆（10px）、边框更淡、有细阴影，整体更轻 */
+    #fc .btn { border:1px solid #e6eaf1; background:#fff; border-radius:10px; padding:8px 20px;
+               font-family:inherit; font-size:13px; font-weight:600; color:var(--text);
+               cursor:pointer; transition:all .15s;
+               box-shadow:0 1px 2px rgba(16,24,40,.05); }
+    #fc .btn:hover { border-color:#d3dae5; background:#fcfdff; }
+    #fc .btn:active { background:#f4f6fa; }
+    #fc .btn.primary { background:var(--brand); border-color:var(--brand); color:#fff;
+                       box-shadow:0 1px 3px rgba(46,123,240,.28), 0 4px 12px rgba(46,123,240,.18); }
+    #fc .btn.primary:hover { background:#2b73e4; border-color:#2b73e4; color:#fff; }
+    #fc .btn.primary.dirty { background:var(--warn); border-color:var(--warn);
+                             box-shadow:0 1px 3px rgba(245,158,11,.28), 0 4px 12px rgba(245,158,11,.18); }
+    #fc .btn.primary.dirty:hover { background:#e08f08; border-color:#e08f08; color:#fff; }
+    #fc .pill.dirty { background:#fdf1dc; color:var(--warn); }
+</style>
+
+<div id="fc">
+<div class="wrap">
+
+    <div class="card st-card">
+        <div class="fan-visual" id="fanBox">
+            <div class="fan-ring">
+                <svg width="88" height="88" viewBox="0 0 72 72">
+                    <g class="fan-rotor" id="fanRotor">
+                        <path class="blade" fill="#4a8af4" d="M36 33 C 32 20 38 9 47 11 C 53 19 47 30 39 34 Z"/>
+                        <path class="blade" fill="#4a8af4" d="M36 33 C 32 20 38 9 47 11 C 53 19 47 30 39 34 Z" transform="rotate(72 36 36)"/>
+                        <path class="blade" fill="#4a8af4" d="M36 33 C 32 20 38 9 47 11 C 53 19 47 30 39 34 Z" transform="rotate(144 36 36)"/>
+                        <path class="blade" fill="#4a8af4" d="M36 33 C 32 20 38 9 47 11 C 53 19 47 30 39 34 Z" transform="rotate(216 36 36)"/>
+                        <path class="blade" fill="#4a8af4" d="M36 33 C 32 20 38 9 47 11 C 53 19 47 30 39 34 Z" transform="rotate(288 36 36)"/>
+                    </g>
+                    <circle class="hub" cx="36" cy="36" r="6.5" fill="#8db4f5"/>
+                    <circle cx="36" cy="36" r="2.2" fill="#ffffff"/>
+                </svg>
+            </div>
+            <span class="pill stop" id="runPill"><i></i>已停转</span>
+
+            <div class="fan-curve">
+                <div class="fc-h"><span class="fc-t">温度 → PWM 曲线</span></div>
+                <div id="curveBox"></div>
+                <div class="hint" id="curveHint"></div>
+            </div>
+        </div>
+        <div class="st-main">
+            <div class="card-h" style="margin-bottom:10px">
+                <div class="card-t">状态</div>
+                <div style="display:flex;align-items:center;gap:10px">
+                    <span class="pill ramp" id="rampPill" style="display:none"><i></i>渐入</span>
+                    <span class="pill stop" id="rulePill"><i></i>常规</span>
+                    <div class="card-s" id="updAt"></div>
+                </div>
+            </div>
+
+            <div class="tiles">
+                <div class="tile"><span>温度</span><b id="tTile">--</b><small>°C</small></div>
+                <div class="tile"><span>转速</span><b id="rTile">--</b><small>RPM</small></div>
+                <div class="tile" id="pT"><span>PWM</span><b id="pTile">--</b><small>%</small>
+                    <div class="jp" id="jpBar" style="display:none"><i id="jpFill"></i></div>
+                    <div class="jp-t" id="jpText" style="display:none"></div>
+                </div>
+                <div class="tile"><span>模式</span><b id="mTile" style="font-size:15px">--</b></div>
+            </div>
+            <div class="src-row">
+                <span>CPU <b id="t-cpu">--</b></span>
+                <span>无线2.4G <b id="t-wifi0">--</b></span>
+                <span>无线5G <b id="t-wifi1">--</b></span>
+                <span>2.5G网口 <b id="t-eth">--</b></span>
+            </div>
+
+            <div class="st-hist">
+                <div class="hist-h">
+                    <div class="card-t" style="font-size:13.5px">温度 / 转速历史</div>
+                    <div class="card-s">最近 <span id="histN">0</span> 个采样点</div>
+                </div>
+                <canvas id="tempChart"></canvas>
+                <div class="legend">
+                    <span><i class="lg-t"></i>控制温度 (°C)　左轴</span>
+                    <span><i class="lg-p"></i>转速 PWM (%)　右轴</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="card savebar">
+        <div class="sb-left">
+            <span class="pill stop" id="dirtyPill"><i></i>已同步</span>
+            <span class="card-s" id="saveState">参数改动后需点击「保存并生效」</span>
+        </div>
+        <div class="sb-right">
+            <button class="btn" id="btnRevert" onclick="doRevert()">放弃修改</button>
+            <button class="btn primary" id="btnSave" onclick="doSave()">保存并生效</button>
+        </div>
+    </div>
+
+    <div class="grid2">
+    <div>
+        <div class="card">
+            <div class="card-h">
+                <div class="card-t">模式</div>
+                <div class="seg" id="modeSeg">
+                    <button data-m="auto" onclick="setMode('auto')">自动挡位</button>
+                    <button data-m="auto_curve" onclick="setMode('auto_curve')">自动曲线</button>
+                    <button data-m="manual" onclick="setMode('manual')">手动</button>
+                </div>
+            </div>
+            <div id="panel-auto" class="panel"></div>
+            <div id="panel-curve" class="panel"></div>
+            <div id="panel-manual" class="panel">
+                <div class="hint">手动占空比在右侧「手动 PWM」卡片中调节，0% 为停转。参数修改即时保存，守护进程按固件采样间隔应用。</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-h">
+                <div class="card-t">夜间模式</div>
+                <label class="sw"><input type="checkbox" id="nightEnabled" onchange="onToggle()"><span class="sw-i"></span></label>
+            </div>
+            <div class="row">
+                <div><div class="lb">静音时段</div><div class="sub">起止时间，支持跨天（如 23:00 → 07:00）</div></div>
+                <div class="timepair">
+                    <input type="time" id="nightStart" onchange="onTime()">
+                    <span class="sep">→</span>
+                    <input type="time" id="nightEnd" onchange="onTime()">
+                </div>
+            </div>
+            <div id="rows-night"></div>
+            <div class="hint" id="nightHint"></div>
+            <div class="hint" style="margin-top:4px">转速渐入：改动后的<b>最长时间</b>。实际时长按改动幅度折算
+                （改 10% 约用 1/8 时长，改满档才用满），所以小改动一两秒到位，不会每次都磨满。设 0 关闭渐变。</div>
+        </div>
+    </div>
+
+    <div>
+        <div class="card">
+            <div class="card-h"><div class="card-t">手动 PWM</div></div>
+            <div class="mp-line">
+                <div class="mp-val">
+                    <input class="mp-num" id="mpVal" type="number" inputmode="decimal" min="0" max="100" step="1" value="0">
+                    <span class="mp-unit">%</span>
+                </div>
+                <input type="range" id="mpSlider" min="0" max="100" step="1" value="50"
+                       oninput="onSlide(this.value)" onchange="onSlideCommit()">
+            </div>
+            <div class="mp-cap">0% 关闭风扇，1% - 100% 直接设置 PWM。可直接输入百分比，或拖动滑条。</div>
+            <div class="chips">
+                <button class="chip danger" onclick="quickPwm(0)"><b>停转</b><em>0%</em></button>
+                <button class="chip" onclick="quickPwm(30)"><b>静音</b><em>30%</em></button>
+                <button class="chip" onclick="quickPwm(50)"><b>中速</b><em>50%</em></button>
+                <button class="chip" onclick="quickPwm(100)"><b>全速</b><em>100%</em></button>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-h">
+                <div class="card-t">温度守护</div>
+                <label class="sw"><input type="checkbox" id="guardEnabled" onchange="onToggle()"><span class="sw-i"></span></label>
+            </div>
+            <div id="rows-guard"></div>
+            <div class="hint">温度升到<b>守护温度</b>时强制按守护转速散热（优先级最高，可压过夜间模式）；
+                降到<b>退出温度</b>以下后交还给常规/夜间规则。两者之间的温度区间保持原状，避免风扇反复启停。</div>
+        </div>
+    </div>
+    </div>
+
+</div>
+<div class="toast" id="toast"></div>
+</div>
+
+<script>
+var INIT = { {{ join(jarr, ',') }} };
+var dataUrl = '{{ url("admin/system/fancontrol/data") }}';
+var saveUrl = '{{ url("admin/system/fancontrol/save") }}';
+// 【两级刷新率】慢档完全跟随固件的 interval 配置，不再硬钳下限。
+// 这里曾经写 Math.max(3, ...)，把间隔钳到最低 3 秒，结果即使固件 interval
+// 配成 1 秒，页面依然 3 秒才更新一次，渐入只剩一两帧。
+// 现在直接采信 uci 的值，固件配几秒就是几秒。
+//
+// 慢档（稳态）：SLOW_MS = interval 秒，默认 1 秒。
+//   温度、转速这类读数一秒一跳完全够看；稳态下风扇基本不动，没必要打高频请求。
+//   这是常态档位，占 99% 的时间，必须省。
+//
+// 快档（点击保存 → PWM 真正到位）：FAST_MS = 250ms。
+//   只有这短短几秒需要把进度条、剩余秒数、PWM 数字画连贯，一到位立刻降回慢档。
+//   注意这是**页面拉数据的频率**，与守护进程写 PWM 的整数秒节拍无关 ——
+//   进度条按服务端快照插值绘制，所以即使 PWM 一秒才跳一档，
+//   进度条本身仍是 250ms 一帧的顺滑动画。
+//
+// 兜底：interval 若被配成 0 或非数字，退到 1 秒，避免 0 导致请求风暴。
+var SLOW_MS = Math.max(1, parseInt(INIT.interval, 10) || 1) * 1000;
+var FAST_MS = 250;
+var refreshMs = SLOW_MS;      // 兼容旧引用，实际节拍由 pollTimer 控制
+var pollMsNow = SLOW_MS;      // 当前生效的节拍，用来判断是否需要重排定时器
+var pollTimer = null;
+
+// 【提速窗口】只在「保存 → PWM 真正到位」这段时间提速，其余时间一律走 SLOW_MS。
+//
+// 曾经用「实际 pwm 与目标不等」来做判据，但那个目标取自 history 最后一行，
+// history 里只要残留一条旧目标（上次改动的），稳态下它就永远不等于 pwm →
+// 快档永不退出，页面变成一直打高频请求。改成只认服务端快照的 ramp_active：
+// 守护进程自己最清楚这段渐入在不在进行、有没有到位，页面不需要二次推断。
+//
+// fastUntil 覆盖「点保存 → 服务端第一拍快照回来」之间的空窗：守护进程节拍是
+// 整数秒，而点下保存到它下一轮落盘最多要等 SLOW_MS，这段空窗里 ramp_active
+// 还是上一轮的 0，得靠保存时间戳兜住，否则提速要晚一拍才生效。
+var fastUntil = 0;
+
+// 服务端快照里的渐入目标 raw 值（0-255），仅用于界面文案，不参与提速判据。
+var rampTargetRaw = null;
+
+// 渐入进度：完全采信服务端 /tmp/fancontrol_ramp 的快照（起止时刻 + 总时长），
+// 不再靠「本次采样 pwm 减上次采样 pwm」去反推——轮询间隔一旦大于 1 秒，反推必失真。
+var rampInfo = null;
+
+var CFG = Object.assign({}, INIT);
+var SAVED = Object.assign({}, INIT);
+var historyData = [];
+var firstLoad = true;
+var lastTemp = 0;
+var lastClock = '';
+// 本次渐入的起点 raw 值：进入渐入时记录，用于算进度条百分比；渐入结束后清空
+var rampFrom = null;
+var wasRamping = false;
+// 温度→PWM 曲线的增量重绘状态（见 drawCurve）：
+//   curveSig      上一次绘制曲线时的参数签名，变了才重建 SVG
+//   curveGeom     重建时存下的坐标换算函数，供动态层算标记位置
+//   curveMarkEl   缓存的 <g id="curveMark"> 节点
+//   curveMarkKey  上一次画标记时的温度（放大 10 倍取整），相同就跳过
+var curveSig = null;
+var curveGeom = null;
+var curveMarkEl = null;
+var curveMarkKey = null;
+
+/* ---------- 工具 ---------- */
+function $(id){ return document.getElementById(id); }
+function raw2pct(r){ return Math.round(r / 255 * 100); }
+function pct2raw(p){ return Math.round(p * 255 / 100); }
+function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+function toast(msg){
+    var el = $('toast'); el.textContent = msg; el.classList.add('show');
+    clearTimeout(el._t); el._t = setTimeout(function(){ el.classList.remove('show'); }, 2200);
+}
+function modeName(m){
+    return m === 'system' ? '系统控制' : m === 'auto' ? '自动挡位' : m === 'auto_curve' ? '自动曲线' : '手动';
+}
+function validVal(v){
+    return !(v === undefined || v === null || v === '' || v === 'undefined' || v === 'null' || (typeof v === 'number' && isNaN(v)));
+}
+function mergeConfig(src){
+    Object.keys(src).forEach(function(k){
+        if(validVal(src[k])) CFG[k] = src[k];
+    });
+}
+
+/* ---------- 参数行（GL 风格步进器） ---------- */
+var ROWS = {
+    auto: [
+        {k:'auto_temp_low',  lb:'起转温度', sub:'低于此温度停转', unit:' ℃', step:1, lo:20, hi:100},
+        {k:'auto_temp_mid',  lb:'中温阈值', sub:'达到后切中速',   unit:' ℃', step:1, lo:20, hi:110},
+        {k:'auto_temp_high', lb:'全速温度', sub:'达到后全速散热', unit:' ℃', step:1, lo:30, hi:120},
+        {k:'auto_pwm_low',  lb:'起转 PWM', sub:'低温区间占空比', pct:1, step:5, lo:0, hi:100},
+        {k:'auto_pwm_mid',  lb:'中速 PWM', sub:'中温区间占空比', pct:1, step:5, lo:0, hi:100},
+        {k:'auto_pwm_high', lb:'全速 PWM', sub:'高温区间占空比', pct:1, step:5, lo:0, hi:100}
+    ],
+    curve: [
+        {k:'min_temp',   lb:'起始温度', sub:'低于此温度保持起始 PWM', unit:' ℃', step:1, lo:20, hi:100},
+        {k:'max_temp',   lb:'满速温度', sub:'达到后保持满速 PWM',     unit:' ℃', step:1, lo:30, hi:110},
+        {k:'min_speed',  lb:'起始 PWM', sub:'起始温度时的占空比', pct:1, step:5, lo:0, hi:100},
+        {k:'max_speed',  lb:'满速 PWM', sub:'满速温度时的占空比', pct:1, step:5, lo:0, hi:100}
+    ],
+    night: [
+        {k:'night_speed', lb:'夜间转速', sub:'0% 停转，建议 20~30%', pct:1, step:5, lo:0, hi:50},
+        {k:'ramp_up',     lb:'渐入时长', sub:'改动后变化的最长时间', unit:' 秒', step:5, lo:0, hi:120}
+    ],
+    guard: [
+        {k:'guard_temp',  lb:'守护温度', sub:'升到此处强制散热', unit:' ℃', step:1, lo:30, hi:120},
+        {k:'guard_exit',  lb:'退出温度', sub:'降到此处交还常规；必须低于守护温度，否则会被自动下调到「守护温度 − 1」', unit:' ℃', step:1, lo:20, hi:120},
+        {k:'guard_speed', lb:'守护转速', sub:'守护期间的强制占空比', pct:1, step:5, lo:0, hi:100}
+    ]
+};
+var HOSTS = {auto:'panel-auto', curve:'panel-curve', night:'rows-night', guard:'rows-guard'};
+function allRows(){ return ROWS.auto.concat(ROWS.curve, ROWS.night, ROWS.guard); }
+
+function dispVal(r){ return r.pct ? raw2pct(CFG[r.k]) : CFG[r.k]; }
+function dispUnit(r){ return r.pct ? '%' : r.unit; }
+
+function buildRows(){
+    Object.keys(HOSTS).forEach(function(g){
+        var host = $(HOSTS[g]);
+        if(!host) return;
+        host.innerHTML = ROWS[g].map(function(r){
+            return '<div class="row"><div><div class="lb">' + r.lb + '</div><div class="sub">' + r.sub + '</div></div>' +
+                '<div style="display:flex;align-items:center;gap:8px">' +
+                '<div class="step">' +
+                '<button type="button" data-step="1" data-k="' + r.k + '" data-d="' + (-r.step) + '" data-lo="' + r.lo + '" data-hi="' + r.hi + '" data-pct="' + (r.pct ? 1 : 0) + '">−</button>' +
+                '<span class="vwrap">' +
+                '<input class="v" type="number" inputmode="decimal" ' +
+                    'id="v-' + r.k + '" data-k="' + r.k + '" data-lo="' + r.lo + '" data-hi="' + r.hi + '" data-pct="' + (r.pct ? 1 : 0) + '" ' +
+                    'value="' + dispVal(r) + '" min="' + r.lo + '" max="' + r.hi + '" step="1">' +
+                '<span class="u">' + dispUnit(r) + '</span>' +
+                '</span>' +
+                '<button type="button" data-step="1" data-k="' + r.k + '" data-d="' + r.step + '" data-lo="' + r.lo + '" data-hi="' + r.hi + '" data-pct="' + (r.pct ? 1 : 0) + '">＋</button>' +
+                '</div></div></div>';
+        }).join('');
+    });
+}
+
+/* 把某个 key 的当前值同步到界面（输入框） */
+function syncRow(k){
+    var r = null;
+    allRows().forEach(function(x){ if(x.k === k) r = x; });
+    if(!r) return;
+    var el = $('v-' + k);
+    if(el){
+        el.value = dispVal(r);
+        setErrState(el, false);
+    }
+}
+
+/* 把 input 的 err 状态同步到外层 .vwrap（边框画在外层，只改 input 看不出效果） */
+function setErrState(el, on){
+    if(!el) return;
+    el.classList.toggle('err', !!on);
+    var w = el.closest ? el.closest('.vwrap') : null;
+    if(w) w.classList.toggle('is-err', !!on);
+}
+
+/* 跨字段合理性校验：退出温度必须低于守护温度，否则守护一触发就立刻退出 */
+function checkGuardOrder(){
+    var t = parseInt(CFG.guard_temp, 10), e = parseInt(CFG.guard_exit, 10);
+    var et = $('v-guard_exit'), tt = $('v-guard_temp');
+    setErrState(et, false);
+    setErrState(tt, false);
+    if(isNaN(t) || isNaN(e)) return true;
+    if(e >= t){
+        setErrState(et, true);
+        return false;
+    }
+    return true;
+}
+
+/* 用户手动输入：聚焦时全选，回车/失焦时提交 */
+function commitRowInput(el){
+    var k = el.dataset.k,
+        lo = parseInt(el.dataset.lo, 10), hi = parseInt(el.dataset.hi, 10),
+        pct = el.dataset.pct === '1';
+    var raw = String(el.value).trim().replace(/[^0-9.\-]/g, '');
+    var n = parseFloat(raw);
+    if(raw === '' || isNaN(n)){
+        // 非法输入：还原为当前值，不修改配置
+        syncRow(k);
+        toast('请输入有效数字');
+        return;
+    }
+    if(pct){
+        // 百分比域：四舍五入到整数百分比，再换算 raw
+        CFG[k] = pct2raw(clamp(Math.round(n), lo, hi));
+    } else {
+        CFG[k] = clamp(Math.round(n), lo, hi);
+    }
+    if(Math.round(n) < lo || Math.round(n) > hi){
+        toast('已限制在 ' + lo + ' ~ ' + hi + (pct ? '%' : '') + ' 之间');
+    }
+    syncRow(k);
+    // 守护双阈值顺序校验：不满足时提示，但保留用户输入（保存前仍可再改）
+    if((k === 'guard_temp' || k === 'guard_exit') && !checkGuardOrder()){
+        toast('退出温度需低于守护温度，当前设置不会生效');
+    }
+    drawCurve();
+    markDirty();
+}
+
+document.getElementById('fc').addEventListener('click', function(e){
+    var b = e.target.closest ? e.target.closest('[data-step]') : null;
+    if(!b) return;
+    var k = b.dataset.k, d = parseInt(b.dataset.d, 10),
+        lo = parseInt(b.dataset.lo, 10), hi = parseInt(b.dataset.hi, 10),
+        pct = b.dataset.pct === '1';
+    if(pct){
+        // 先在百分比域内对齐到 step 的整数倍，再换算回 raw，避免 raw↔pct 反复取整造成漂移
+        var curPct = raw2pct(CFG[k]);
+        var nextPct = Math.round((curPct + d) / Math.abs(d)) * Math.abs(d);
+        CFG[k] = pct2raw(clamp(nextPct, lo, hi));
+    } else {
+        CFG[k] = clamp(CFG[k] + d, lo, hi);
+    }
+    syncRow(k);
+    drawCurve();
+    markDirty();
+});
+
+/* 数值输入框：回车提交、失焦提交、聚焦全选；上下方向键走原生步进 */
+document.getElementById('fc').addEventListener('input', function(e){
+    if(e.target.classList && e.target.classList.contains('v')){
+        setErrState(e.target, false);
+    }
+    if(e.target.id === 'mpVal'){
+        onPwmInput();
+    }
+}, true);
+document.getElementById('fc').addEventListener('keydown', function(e){
+    if(e.target.classList && e.target.classList.contains('v') && e.key === 'Enter'){
+        e.target.blur();
+    }
+    if(e.target.id === 'mpVal' && e.key === 'Enter'){
+        e.target.blur();
+    }
+}, true);
+document.getElementById('fc').addEventListener('focusin', function(e){
+    if(e.target.classList && e.target.classList.contains('v')){
+        e.target.select();
+    }
+    if(e.target.id === 'mpVal'){
+        e.target.select();
+    }
+}, true);
+document.getElementById('fc').addEventListener('focusout', function(e){
+    if(e.target.classList && e.target.classList.contains('v')){
+        commitRowInput(e.target);
+    }
+    if(e.target.id === 'mpVal'){
+        onPwmCommit();
+    }
+}, true);
+
+/* ---------- 模式 ---------- */
+function syncModeUI(){
+    var m = CFG.mode;
+    var segs = document.querySelectorAll('#modeSeg button');
+    for(var i = 0; i < segs.length; i++) segs[i].classList.toggle('active', segs[i].dataset.m === m);
+    $('panel-auto').classList.toggle('show', m === 'auto');
+    $('panel-curve').classList.toggle('show', m === 'auto_curve');
+    $('panel-manual').classList.toggle('show', m === 'manual');
+    drawCurve();
+}
+
+function setMode(m){
+    if(CFG.mode === m) return;
+    CFG.mode = m;
+    syncModeUI();
+    markDirty();
+}
+
+/* ---------- 手动 PWM ---------- */
+function syncSlider(){
+    var pct = raw2pct(CFG.manual_speed);
+    $('mpSlider').value = pct;
+    $('mpSlider').style.setProperty('--fill', pct + '%');
+    $('mpVal').value = pct;
+}
+function onSlide(v){
+    var p = clamp(Math.round(parseFloat(v) || 0), 0, 100);
+    $('mpVal').value = p;
+    $('mpSlider').style.setProperty('--fill', p + '%');
+}
+/* 手动 PWM：直接输入百分比 */
+function onPwmInput(){
+    var n = parseFloat($('mpVal').value);
+    if(isNaN(n)) return;
+    var p = clamp(Math.round(n), 0, 100);
+    $('mpSlider').value = p;
+    $('mpSlider').style.setProperty('--fill', p + '%');
+}
+function onPwmCommit(){
+    var n = parseFloat($('mpVal').value);
+    if(isNaN(n)){ syncSlider(); toast('请输入 0~100 的数字'); return; }
+    var p = clamp(Math.round(n), 0, 100);
+    if(Math.round(n) !== p) toast('已限制在 0 ~ 100% 之间');
+    CFG.manual_speed = pct2raw(p);
+    if(CFG.mode !== 'manual'){
+        CFG.mode = 'manual';
+        syncModeUI();
+        toast('已选为手动模式，记得点「保存并生效」');
+    }
+    syncSlider();
+    markDirty();
+}
+function onSlideCommit(){
+    CFG.manual_speed = pct2raw(parseInt($('mpSlider').value, 10));
+    if(CFG.mode !== 'manual'){
+        CFG.mode = 'manual';
+        syncModeUI();
+        toast('已选为手动模式，记得点「保存并生效」');
+    }
+    markDirty();
+}
+function quickPwm(p){
+    CFG.manual_speed = pct2raw(p);
+    if(CFG.mode !== 'manual'){ CFG.mode = 'manual'; syncModeUI(); }
+    syncSlider();
+    markDirty();
+    toast(p === 0 ? '已选停转，记得点「保存并生效」' : '已选 ' + p + '%，记得点「保存并生效」');
+}
+
+/* ---------- 夜间模式 / 温度守护 ---------- */
+function hm2m(s){ var p = (s || '0:0').split(':'); return (+p[0]) * 60 + (+p[1]); }
+function inNight(hhmm){
+    var s = hm2m(CFG.night_start), e = hm2m(CFG.night_end), n = hm2m(hhmm);
+    return s <= e ? (n >= s && n < e) : (n >= s || n < e);
+}
+function updateNightHint(){
+    var base = (String(CFG.night_enabled) === '1' ? '已启用' : '已关闭') +
+               ' · 窗口 ' + CFG.night_start + ' → ' + CFG.night_end;
+    $('nightHint').textContent = lastClock
+        ? (base + ' · 路由器时间 ' + lastClock + (inNight(lastClock) ? '（窗口内）' : '（窗口外）'))
+        : (base + '（支持跨天）');
+}
+function syncExtras(){
+    $('nightEnabled').checked = String(CFG.night_enabled) === '1';
+    $('guardEnabled').checked = String(CFG.guard_enabled) === '1';
+    $('nightStart').value = CFG.night_start;
+    $('nightEnd').value = CFG.night_end;
+    updateNightHint();
+}
+function onToggle(){
+    CFG.night_enabled = $('nightEnabled').checked ? 1 : 0;
+    CFG.guard_enabled = $('guardEnabled').checked ? 1 : 0;
+    updateNightHint();
+    markDirty();
+}
+function onTime(){
+    CFG.night_start = $('nightStart').value || '23:00';
+    CFG.night_end = $('nightEnd').value || '07:00';
+    updateNightHint();
+    markDirty();
+}
+
+/* ---------- 手动保存 ---------- */
+function isDirty(){
+    return Object.keys(SAVED).some(function(k){ return String(SAVED[k]) !== String(CFG[k]); });
+}
+function markDirty(){
+    var d = isDirty();
+    $('dirtyPill').className = 'pill ' + (d ? 'dirty' : 'stop');
+    $('dirtyPill').innerHTML = d ? '<i></i>有未保存的修改' : '<i></i>已同步';
+    $('btnSave').classList.toggle('dirty', d);
+    $('btnRevert').style.display = d ? '' : 'none';
+    if(d && $('saveState').textContent.indexOf('已保存') !== 0){
+        $('saveState').textContent = '改动尚未下发，点击「保存并生效」';
+    }
+    previewPending(d);
+}
+
+/* 改动未保存时，在 PWM 格里预告「保存后会渐入到多少」——让加减档也能看到将要发生的变化 */
+function previewPending(dirty){
+    var pT = $('pT'), jpBar = $('jpBar'), jpFill = $('jpFill'), jpText = $('jpText');
+    if(!pT || !jpBar) return;
+
+    // 先无条件清掉渐入外观，再由下面的分支决定是否重新点亮。
+    // 这一步必须在早退（!dirty / 模式不适用 / 目标与当前相同）之前执行，
+    // 否则「改一下再放弃修改」时进度条会一直留在格子里。
+    // 注意：底部预留空间已改为 .tile 常驻（见 CSS），这里不再需要管 has-jp。
+    function clearJp(){
+        pT.classList.remove('ramping');
+        if(jpBar) jpBar.style.display = 'none';
+        if(jpText) jpText.style.display = 'none';
+    }
+
+    if(!dirty || CFG.mode === 'system'){ clearJp(); return; }  // 没改动 / 系统模式：交给 updateStatus
+
+    // 按当前模式算出保存后的目标 PWM（百分比）
+    var target = null, label = '';
+    if(CFG.mode === 'manual'){
+        target = raw2pct(CFG.manual_speed); label = '手动';
+    } else if(CFG.mode === 'auto'){
+        target = currentAutoPct(); label = '自动挡位';
+    } else if(CFG.mode === 'auto_curve'){
+        target = currentCurvePct(); label = '自动曲线';
+    }
+    if(target === null){ clearJp(); return; }
+
+    // 只有目标与当前实际不同才提示（相同则保存后无需渐入）
+    var cur = parseInt($('pTile').textContent, 10);
+    if(isNaN(cur)) cur = 0;
+    if(target === cur){ clearJp(); return; }
+
+    pT.classList.add('ramping');
+    jpBar.style.display = '';
+    jpText.style.display = '';
+    jpFill.style.width = '0%';
+    jpText.textContent = '保存后 ' + label + '渐入 ' + cur + '% → ' + target + '%';
+}
+
+/* 依据当前温度与 auto 挡位阈值，推算目标 PWM 百分比 */
+function currentAutoPct(){
+    var t = lastTemp;
+    if(!t) return null;
+    var f = function(k, d){ var v = parseInt(CFG[k], 10); return isNaN(v) ? d : v; };
+    var lo = f('auto_temp_low', 50), mid = f('auto_temp_mid', 60), hi = f('auto_temp_high', 75);
+    if(t < lo) return 0;
+    if(t < mid) return raw2pct(f('auto_pwm_low', 50));
+    if(t < hi) return raw2pct(f('auto_pwm_mid', 128));
+    return raw2pct(f('auto_pwm_high', 255));
+}
+
+/* 依据当前温度与线性曲线参数，推算目标 PWM 百分比 */
+function currentCurvePct(){
+    var t = lastTemp;
+    if(!t) return null;
+    var f = function(k, d){ var v = parseInt(CFG[k], 10); return isNaN(v) ? d : v; };
+    var mn = f('min_temp', 40), mx = f('max_temp', 70);
+    var s0 = f('min_speed', 50), s1 = f('max_speed', 255);
+    if(t <= mn) return raw2pct(s0);
+    if(t >= mx) return raw2pct(s1);
+    if(mx === mn) return raw2pct(s1);
+    return raw2pct(s0 + (s1 - s0) * (t - mn) / (mx - mn));
+}
+function doRevert(){
+    CFG = Object.assign({}, SAVED);
+    buildRows();
+    syncModeUI();
+    syncSlider();
+    syncExtras();
+    drawCurve();
+    markDirty();
+    toast('已放弃未保存的修改');
+}
+function doSave(){
+    if(CFG.mode === 'auto' && !(CFG.auto_temp_low < CFG.auto_temp_mid && CFG.auto_temp_mid < CFG.auto_temp_high)){
+        toast('注意：自动挡位阈值应满足 起转 < 中温 < 全速');
+    }
+    var KEYS = ['mode','manual_speed',
+                'auto_temp_low','auto_temp_mid','auto_temp_high',
+                'auto_pwm_low','auto_pwm_mid','auto_pwm_high',
+                'min_temp','max_temp','min_speed','max_speed',
+                'night_enabled','night_start','night_end','night_speed','ramp_up',
+                'guard_enabled','guard_temp','guard_exit','guard_speed'];
+    var body = new URLSearchParams();
+    var missing = [];
+    KEYS.forEach(function(k){
+        if(validVal(CFG[k])) body.append(k, CFG[k]);
+        else missing.push(k);
+    });
+    if(missing.length){
+        toast('以下参数无有效值，已跳过：' + missing.join(', '));
+        console.error('skip invalid keys:', missing, CFG);
+    }
+    fetch(saveUrl, { method:'POST', body:body, headers:{'Content-Type':'application/x-www-form-urlencoded'} })
+        .then(function(resp){
+            if(!resp.ok){ throw new Error('HTTP ' + resp.status); }
+            return resp.text();
+        })
+        .then(function(txt){
+            var j = null;
+            try { j = JSON.parse(txt); } catch(e){ console.error('save resp:', txt); }
+            if(j && j.status === 'ok'){
+                // 后端返回提交后从磁盘回读的权威值，直接采信并回填界面
+                // （不再依赖「前端以为写了什么」，避免显示与实际不一致）
+                if(j.config) { mergeConfig(j.config); }
+                SAVED = Object.assign({}, CFG);
+                buildRows(); syncModeUI(); syncSlider(); syncExtras(); markDirty(); checkGuardOrder();
+                if(j.failed){
+                    toast('部分参数未写入：' + j.failed);
+                    $('saveState').textContent = '部分写入失败 · ' + new Date().toLocaleTimeString();
+                } else if(j.warn === 'guard_exit>=guard_temp'){
+                    // 守护进程会把它夹到「守护温度 − 1」以保证能退出闭锁，
+                    // 所以功能不会失效，只是回差被压成 1 ℃。说明清楚即可，不必阻止保存。
+                    toast('退出温度不低于守护温度，已按「守护温度 − 1」生效');
+                    $('saveState').textContent = '已保存（退出温度已自动下调为守护温度 − 1）· ' + new Date().toLocaleTimeString();
+                } else {
+                    toast('已保存并立即生效');
+                    $('saveState').textContent = '已保存并生效 · ' + new Date().toLocaleTimeString();
+                }
+                // 【提速窗口起点】服务端读盘后到守护进程下一次落盘之间有延迟，
+                // 这段空窗里 ramp_active 还是 0，靠时间戳把提速提前打开。
+                // 给足 SLOW_MS × 2 + 2 秒：够守护进程走完「被唤醒 → 应用新值 →
+                // 开始渐入 → 落盘 ramp_active=1」；一旦它落盘了，下面的
+                // inFastWindow 就改由 ramp_active 接管，时间戳自然失效。
+                fastUntil = Date.now() + SLOW_MS * 2 + 2000;
+                syncPollRate(true);   // 立刻切快档，不等下一次轮询才发现
+                setTimeout(function(){ fetchData(true); }, 1200);
+            } else {
+                toast('保存失败：' + (j && j.status ? j.status : '返回非 JSON'));
+                $('saveState').textContent = '保存失败 · ' + new Date().toLocaleTimeString();
+            }
+        })
+        .catch(function(e){
+            toast('保存失败：' + e.message + '（请按 Ctrl+F5 刷新页面后重试）');
+            $('saveState').textContent = '保存失败：' + e.message;
+            console.error('save failed', e);
+        });
+}
+
+/* ---------- 数据拉取与状态刷新 ---------- */
+
+/*
+ * 轮询节拍：慢档 ↔ 快档自动切换。
+ *
+ * 用「每次请求回来后再排下一次」的链式 setTimeout，而不是 setInterval：
+ *   - setInterval 在请求变慢时会堆积，且改节拍必须 clearInterval 重建；
+ *   - 链式调度天然保证「上一次回来才发下一次」，网络抖动时不会雪崩。
+ * 节拍变化时才重建定时器；节拍未变则继续沿用，避免每轮都 clearTimeout/重建。
+ */
+function syncPollRate(fast){
+    var want = fast ? FAST_MS : SLOW_MS;
+    if(want === pollMsNow && pollTimer) return;
+    pollMsNow = want;
+    if(pollTimer){ clearTimeout(pollTimer); pollTimer = null; }
+    pollTimer = setTimeout(pollTick, pollMsNow);
+}
+function pollTick(){
+    pollTimer = null;
+    var p = fetchData();
+    // 请求结束后再排下一拍；fetchData 出错也要继续，不能停摆
+    if(p && typeof p.then === 'function'){
+        p.then(function(){ if(!pollTimer) pollTimer = setTimeout(pollTick, pollMsNow); },
+               function(){ if(!pollTimer) pollTimer = setTimeout(pollTick, pollMsNow); });
+    } else {
+        pollTimer = setTimeout(pollTick, pollMsNow);
+    }
+}
+
+function fetchData(reloadCfg){
+    // 返回 Promise 供链式轮询（pollTick）在请求结束后再排下一拍
+    return fetch(dataUrl, { cache:'no-store' })
+        .then(function(resp){ return resp.json(); })
+        .then(function(j){
+            historyData = parseHistory(j.history || '');
+            // 首次加载、或保存后显式回读时，用 uci 真实值刷新配置与控件
+            if((firstLoad || reloadCfg) && j.config){
+                // 只吸收「有效值」：控制器对 uci 里缺失的键会返回空串，
+                // 直接 Object.assign 会把 INIT 里正确的默认值覆盖成空，导致保存时发空值。
+                mergeConfig(j.config);
+                SAVED = Object.assign({}, CFG);
+                buildRows(); syncModeUI(); syncSlider(); syncExtras(); markDirty(); checkGuardOrder();
+            }
+            updateStatus(j.now || {}, j.service || {});
+            drawChart();
+            firstLoad = false;
+            return true;
+        })
+        .catch(function(e){ console.error(e); return false; });
+}
+
+function parseHistory(text){
+    return text.trim().split('\n').filter(function(l){ return l; }).map(function(line){
+        var p = line.split(',');
+        return { ts:+p[0], control_temp:parseFloat(p[1])||0, cpu_temp:p[2]===''?null:parseFloat(p[2]),
+                 wifi0_temp:p[3]===''?null:parseFloat(p[3]), wifi1_temp:p[4]===''?null:parseFloat(p[4]),
+                 eth_temp:p[5]===''?null:parseFloat(p[5]), speed:parseInt(p[6])||0,
+                 mode:p[7], rpm:p.length>8?(parseInt(p[8])||0):0,
+                 reason:p[9]||'', in_night:p[10]||'0', guard_active:p[11]||'0',
+                 target:p.length>12 ? (parseInt(p[12])||0) : null };
+    });
+}
+
+function updateStatus(now, svc){
+    var pwm = now.pwm || 0, rpm = now.rpm || 0, temp = now.temp || 0;
+    var pct = raw2pct(pwm);
+
+    // 守护进程记录的「本轮目标转速」：渐入期间它先于实际 pwm 到位
+    var tgtRaw = null;
+    if(historyData.length){
+        var lt = historyData[historyData.length - 1];
+        if(lt.target !== null && !isNaN(lt.target)) tgtRaw = lt.target;
+        else tgtRaw = lt.speed;   // 兼容旧格式历史行
+    }
+    var tgtPct = tgtRaw === null ? null : raw2pct(tgtRaw);
+    var ramping = tgtPct !== null && tgtRaw !== pwm;
+
+    // 服务端快照里的目标值：用于「是否还需高频轮询」——只要实际 pwm 还没追到它，
+    // 就保持快档；ramp_active 已经归 0 但 pwm 还差最后一格时也不会提前降档。
+    //
+    // 【必须在下面 syncPollRate 之前赋值】否则读到的还是上一轮的旧值，
+    // 提速窗口会晚一拍开始、晚一拍结束 —— 这正是最初改动时踩过的坑。
+    rampTargetRaw = (now.ramp_to !== undefined && now.ramp_to !== null) ? +now.ramp_to : null;
+
+    // 【提速窗口】判据恢复为「本地推算的渐入状态 + 服务端目标值」，
+    // 而不是只看服务端的 ramp_active。
+    //
+    // 为什么改回来：只看 ramp_active 会在**渐入末尾**提前降档 ——
+    // 守护进程把 ramp_active 归 0 的时刻，实际 pwm 往往还差最后一格没追上。
+    // 一旦降到 SLOW_MS(1 秒)，进度条尾部就只能按 1 秒一格地跳，
+    // 前面还在 250ms 平滑走、最后一段突然变得一顿一顿，观感就是「动画变差了」。
+    //
+    // rampTargetRaw 取自服务端快照的 ramp_to：只要 pwm 还没追到它就一直保持快档，
+    // 正好补上这段尾巴。ramping 是本地用 history 末行推算的，覆盖温度波动
+    // 触发的自动渐入；fastUntil 兜住「点保存 → 第一拍快照回来」之间的空窗。
+    // 三者取或，谁先触发都能及时提速，且不会提前掉档。
+    syncPollRate(ramping || (rampTargetRaw !== null && pwm !== rampTargetRaw) || fastUntil > Date.now());
+
+    $('tTile').textContent = temp.toFixed(1);
+    $('rTile').textContent = rpm;
+    $('pTile').textContent = pct;
+    $('pTile').title = '实际 PWM ' + pct + '%' +
+                       (ramping ? ' → 目标 ' + tgtPct + '%' : '');
+
+    var runMode = historyData.length ? historyData[historyData.length - 1].mode : CFG.mode;
+    $('mTile').textContent = modeName(runMode) + (runMode !== CFG.mode ? ' → ' + modeName(CFG.mode) : '');
+    $('updAt').textContent = '更新于 ' + new Date().toLocaleTimeString();
+
+    // 渐入进度提示（状态卡右上角的小胶囊）。
+    // 【全部模式都显示】自动挡/自动曲线/手动/手动曲线只要在渐入就提示。
+    // 早先只在手动模式显示，是因为担心自动模式下温度一波动就触发小渐入、
+    // 胶囊反复闪；但实测那样会让用户误以为「自动挡不会渐入」。
+    // 真正让提示闪的是「无脑重写 innerHTML」——每帧赋值会让浏览器反复解析 HTML
+    // 并触发该行重排。这里改为**只在文案真的变了才写**，闪烁问题即消失，
+    // 于是不再需要模式门槛。
+    var rp2 = $('rampPill');
+    if(rp2){
+        if(ramping){
+            var pillTxt = (tgtRaw > pwm ? '升速' : '降速') + ' ' + pct + '% → ' + tgtPct + '%';
+            if(rp2.style.display === 'none') rp2.style.display = '';
+            rp2.className = 'pill ramp';
+            if(rp2.getAttribute('data-txt') !== pillTxt){
+                rp2.setAttribute('data-txt', pillTxt);
+                rp2.innerHTML = '<i class="spin"></i>' + pillTxt;
+            }
+        } else if(rp2.style.display !== 'none'){
+            rp2.style.display = 'none';
+            rp2.removeAttribute('data-txt');
+        }
+    }
+
+    // PWM 格内的渐入进度条。
+    // 进度与剩余时间都来自服务端快照（ramp_active/from/to/dur/remain）：
+    // 服务端知道这段渐入的准确起点与时长，算出来的百分比在刷新间隔较大时也不会跳。
+    // 旧实现用「本次采样 pwm - 上次采样 pwm」反推，刷新一慢就严重滞后。
+    if(ramping && !wasRamping){ rampFrom = pwm; }
+    if(!ramping){ rampFrom = null; }
+    wasRamping = ramping;
+
+    rampInfo = now.ramp_active === 1 ? now : null;
+
+    var pT = $('pT'), jpBar = $('jpBar'), jpFill = $('jpFill'), jpText = $('jpText');
+    if(pT && jpBar && jpFill && jpText && !isDirty()){
+        var ok = false;
+        // 【全部模式都显示】不再限定手动模式。
+        // 自动挡/自动曲线下由温度波动触发的小渐入同样有进度可看，
+        // 提示对用户是有信息的；闪烁问题已由「文案不变不重写」解决（见上方胶囊）。
+        if(rampInfo){
+            var rf = +rampInfo.ramp_from, rt = +rampInfo.ramp_to;
+            var dur = +rampInfo.ramp_dur, remain = Math.max(0, +rampInfo.ramp_remain);
+            if(dur > 0){
+                var done = (dur - remain) / dur;
+                done = done < 0 ? 0 : (done > 1 ? 1 : done);
+                pT.classList.add('ramping');
+                jpBar.style.display = '';
+                jpText.style.display = '';
+                jpFill.style.width = (done * 100).toFixed(1) + '%';
+                var left = remain >= 1 ? Math.ceil(remain) : 0;
+                jpText.textContent = (rt > rf ? '升速' : '降速') + '中 · ' +
+                                     (left > 0 ? '约 ' + left + ' 秒到位' : '即将到位');
+                ok = true;
+            }
+        }
+        if(!ok){
+            pT.classList.remove('ramping');
+            jpBar.style.display = 'none';
+            jpText.style.display = 'none';
+        }
+    }
+
+    if(now.time){ lastClock = now.time; }
+    updateNightHint();
+
+    var rp = $('rulePill');
+    if(historyData.length){
+        var lr = historyData[historyData.length - 1];
+        if(lr.guard_active === '1' && CFG.mode !== 'system'){
+            rp.className = 'pill guard'; rp.innerHTML = '<i></i>温度守护';
+        } else if(lr.in_night === '1' && CFG.mode !== 'system'){
+            rp.className = 'pill night'; rp.innerHTML = '<i></i>夜间静音';
+        } else {
+            rp.className = 'pill stop'; rp.innerHTML = '<i></i>常规';
+        }
+    }
+
+    var box = $('fanBox'), pill = $('runPill');
+    // 超过 80% 就把扇叶染成彩虹色（视觉提示「正在高速运转」）。
+    // 用 class 切换而不是直接改 fill，配色交给 CSS 管，阈值只在这里出现一次。
+    if(pct > RAINBOW_PCT) box.classList.add('rainbow');
+    else box.classList.remove('rainbow');
+
+    if(pwm === 0){
+        fanStopped = true;
+        box.classList.add('stopped');
+        pill.className = 'pill stop'; pill.innerHTML = '<i></i>已停转';
+    } else {
+        fanStopped = false;
+        box.classList.remove('stopped');
+        // 转速映射：PWM 越大转得越快，一圈耗时 2.4s → 0.4s。
+        // 只改角速度，角度由 fanSpin 连续积分 —— 不再像以前那样改
+        // animation-duration 导致角度跳变（详见 CSS 里 .fan-rotor 的注释）。
+        fanDur = 2.4 - 2.0 * pwm / 255;
+        pill.className = 'pill run'; pill.innerHTML = '<i></i>运行中';
+    }
+
+    if(historyData.length){
+        var last = historyData[historyData.length - 1];
+        $('t-cpu').textContent = last.cpu_temp === null ? '--' : last.cpu_temp.toFixed(1) + '°C';
+        $('t-wifi0').textContent = last.wifi0_temp === null ? '--' : last.wifi0_temp.toFixed(1) + '°C';
+        $('t-wifi1').textContent = last.wifi1_temp === null ? '--' : last.wifi1_temp.toFixed(1) + '°C';
+        $('t-eth').textContent = last.eth_temp === null ? '--' : last.eth_temp.toFixed(1) + '°C';
+    }
+
+    // 服务运行状态 / 内核温度监管：已从界面移除（守卫式取值，节点不存在也不报错）
+    var sd = $('svcDot'), st = $('svcTxt');
+    if(sd && st){
+        if(svc.pid){
+            sd.className = 'dot g'; st.textContent = '运行中 · pid ' + svc.pid + (svc.autostart ? ' · 开机自启' : '');
+        } else {
+            sd.className = 'dot r'; st.textContent = '未运行' + (svc.autostart ? '' : ' · 未设自启');
+        }
+    }
+    var td = $('tzDot'), tt = $('tzTxt');
+    if(td && tt){
+        if(now.tz_mode === 'disabled'){
+            td.className = 'dot g'; tt.textContent = '已关闭 · 插件独占风扇';
+        } else {
+            td.className = 'dot o'; tt.textContent = (now.tz_mode || '?') + ' · 内核可能与插件抢风扇';
+        }
+    }
+
+    $('histN').textContent = historyData.length;
+    drawCurve();
+}
+
+/* ---------- 温度→PWM 曲线 ---------- */
+// 【性能】这张图以前每轮轮询都整块重建：
+//   $('curveBox').innerHTML = '<svg>…</svg>'
+// 一次 innerHTML 赋值 = 丢弃整棵 SVG 子树 + 重新解析 + 重新布局 + 重新绘制。
+// 稳态 1 秒一次还勉强，但自动模式下温度在变、轮询也在跑，就明显发卡。
+//
+// 现在拆成两层：
+//   1) 静态层（网格 + 坐标 + 曲线路径）：只在**曲线参数变化**时重建，
+//      用一个签名（mode + 各阈值）比对，没变就直接复用；
+//   2) 动态层（红色温度标记）：单独一个 <g id="curveMark">，每帧只改两行
+//      line/text 的坐标与内容 —— 不碰 DOM 结构，成本可忽略。
+var curveSig = null;      // 上一次画曲线时的参数签名
+function curveSignature(){
+    var m = CFG.mode;
+    if(m === 'auto') return m + '|' + CFG.auto_temp_low + ',' + CFG.auto_temp_mid + ',' + CFG.auto_temp_high +
+                                     ',' + CFG.auto_pwm_low + ',' + CFG.auto_pwm_mid + ',' + CFG.auto_pwm_high;
+    if(m === 'auto_curve') return m + '|' + CFG.min_temp + ',' + CFG.max_temp + ',' + CFG.min_speed + ',' + CFG.max_speed;
+    if(m === 'manual') return m + '|' + CFG.manual_speed;
+    return m;
+}
+function drawCurve(){
+    // 曲线图已并入风扇列（窄列），用更紧凑的纵横比，viewBox 会随容器等比缩放
+    var W = 200, H = 150, ML = 28, MB = 22, MT = 8, MR = 6;
+    var x0 = 30, x1 = 100;
+    function X(t){ return ML + (t - x0) / (x1 - x0) * (W - ML - MR); }
+    function Y(s){ return H - MB - s / 255 * (H - MB - MT); }
+    var m = CFG.mode, pts = '', lineColor = '#2563eb';
+
+    function seg(t1, s1, t2, s2){ pts += ' L' + X(t2).toFixed(1) + ' ' + Y(s2).toFixed(1); }
+
+    if(m === 'auto'){
+        var lo = CFG.auto_temp_low, mid = CFG.auto_temp_mid, hi = CFG.auto_temp_high;
+        pts = 'M' + X(x0).toFixed(1) + ' ' + Y(0).toFixed(1);
+        seg(x0,0,lo,0); pts += ' L' + X(lo).toFixed(1) + ' ' + Y(CFG.auto_pwm_low).toFixed(1);
+        pts += ' L' + X(mid).toFixed(1) + ' ' + Y(CFG.auto_pwm_low).toFixed(1);
+        pts += ' L' + X(mid).toFixed(1) + ' ' + Y(CFG.auto_pwm_mid).toFixed(1);
+        pts += ' L' + X(hi).toFixed(1) + ' ' + Y(CFG.auto_pwm_mid).toFixed(1);
+        pts += ' L' + X(hi).toFixed(1) + ' ' + Y(CFG.auto_pwm_high).toFixed(1);
+        pts += ' L' + X(x1).toFixed(1) + ' ' + Y(CFG.auto_pwm_high).toFixed(1);
+    } else if(m === 'auto_curve'){
+        var mn = CFG.min_temp, mx = CFG.max_temp;
+        pts = 'M' + X(x0).toFixed(1) + ' ' + Y(CFG.min_speed).toFixed(1);
+        pts += ' L' + X(mn).toFixed(1) + ' ' + Y(CFG.min_speed).toFixed(1);
+        pts += ' L' + X(mx).toFixed(1) + ' ' + Y(CFG.max_speed).toFixed(1);
+        pts += ' L' + X(x1).toFixed(1) + ' ' + Y(CFG.max_speed).toFixed(1);
+    } else if(m === 'manual'){
+        pts = 'M' + X(x0).toFixed(1) + ' ' + Y(CFG.manual_speed).toFixed(1) +
+              ' L' + X(x1).toFixed(1) + ' ' + Y(CFG.manual_speed).toFixed(1);
+        lineColor = '#f59e0b';
+    }
+
+    var sig = curveSignature() + '|' + pts + '|' + lineColor;
+    var box = $('curveBox');
+    var sigChanged = (sig !== curveSig);
+
+    if(sigChanged){
+        curveSig = sig;
+        var grid = '', labels = '';
+        [40,60,80,100].forEach(function(t){
+            grid += '<line x1="' + X(t) + '" y1="' + MT + '" x2="' + X(t) + '" y2="' + (H-MB) + '" stroke="#eef1f6"/>';
+            labels += '<text x="' + X(t) + '" y="' + (H-8) + '" font-size="9" fill="#8a94a6" text-anchor="middle">' + t + '°</text>';
+        });
+        // 纵轴按百分比标注（内部仍是 0~255，只是显示 0~100%）
+        [0, 20, 40, 60, 80, 100].forEach(function(p){
+            var y = Y(pct2raw(p));
+            grid += '<line x1="' + ML + '" y1="' + y.toFixed(1) + '" x2="' + (W-MR) + '" y2="' + y.toFixed(1) + '" stroke="#eef1f6"/>';
+            labels += '<text x="' + (ML-4) + '" y="' + (y+3).toFixed(1) + '" font-size="8.5" fill="#8a94a6" text-anchor="end">' + p + '%</text>';
+        });
+        // 标记放进独立的 <g>，之后每帧只改它的坐标，不再重建整个 SVG
+        box.innerHTML =
+            '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;display:block">' +
+            grid + labels +
+            (pts ? '<path d="' + pts + '" fill="none" stroke="' + lineColor + '" stroke-width="2"/>' : '') +
+            '<g id="curveMark"></g></svg>';
+        // 把它暴露给下面的动态更新（闭包外要用）
+        curveGeom = { X:X, MT:MT, MB:MB };
+        curveMarkEl = null;    // 强制下面重新取一次节点
+    }
+
+    // ---- 动态层：只动温度标记，不重建 SVG ----
+    var g = curveMarkEl || (curveMarkEl = document.getElementById('curveMark'));
+    if(!g) return;
+    var G = curveGeom;
+    var show = (lastTemp > 0 && lastTemp >= x0 && lastTemp <= x1);
+    var key = show ? Math.round(lastTemp * 10) : -1;
+    if(key === curveMarkKey) return;    // 温度没变（或同一次显示），完全不碰 DOM
+    curveMarkKey = key;
+    if(!show){ g.innerHTML = ''; return; }
+    var mx = G.X(lastTemp).toFixed(1);
+    g.innerHTML =
+        '<line x1="' + mx + '" y1="' + G.MT + '" x2="' + mx + '" y2="' + (H-G.MB) +
+        '" stroke="#ef4444" stroke-dasharray="3 3"/>' +
+        '<text x="' + mx + '" y="' + (G.MT+9) + '" font-size="9" fill="#ef4444" text-anchor="middle">' +
+        lastTemp.toFixed(0) + '°</text>';
+
+    $('curveHint').textContent = m === 'auto' ? '台阶曲线：低于起转温度停转，各区间占空比恒定。'
+        : m === 'auto_curve' ? '线性曲线：温度在起始与满速之间时占空比线性上升。'
+        : m === 'manual' ? '手动模式：占空比固定。' : '系统控制：由内核 thermal 框架调速。';
+}
+
+/* ---------- 历史图表 ---------- */
+var canvas = $('tempChart'), ctx = canvas.getContext('2d');
+// 【性能】给 canvas.width/height 赋值会**重新分配整块位图并清空**，
+// 即使赋的是同一个值。以前每轮轮询都无脑赋值一次 = 每帧丢弃重建位图。
+// 现在只在尺寸真的变了（首次渲染 / 窗口缩放）时才重设，其余帧只做 clearRect。
+var chartW = 0, chartH = 0, chartDpr = 0;
+function drawChart(){
+    var rect = canvas.getBoundingClientRect();
+    var dpr = window.devicePixelRatio || 1;
+    var needW = Math.round(rect.width * dpr), needH = Math.round(rect.height * dpr);
+    if(needW !== chartW || needH !== chartH || dpr !== chartDpr){
+        chartW = needW; chartH = needH; chartDpr = dpr;
+        canvas.width = needW; canvas.height = needH;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var w = rect.width, h = rect.height;
+    ctx.clearRect(0, 0, w, h);
+
+    if(historyData.length < 2){
+        ctx.fillStyle = '#94a3b8'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('等待数据...', w/2, h/2); return;
+    }
+    var minT = Math.min.apply(null, historyData.map(function(d){ return d.control_temp; }));
+    var maxT = Math.max.apply(null, historyData.map(function(d){ return d.control_temp; }));
+    var pad = (maxT - minT || 4) * 0.2; minT -= pad; maxT += pad;
+    var mg = {top:14, right:14, bottom:26, left:36};
+    var pw = w - mg.left - mg.right, ph = h - mg.top - mg.bottom;
+
+    ctx.strokeStyle = '#eef1f6'; ctx.lineWidth = 1; ctx.fillStyle = '#8a94a6';
+    ctx.font = '10px sans-serif'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    for(var i = 0; i <= 4; i++){
+        var y = mg.top + ph * i / 4;
+        ctx.beginPath(); ctx.moveTo(mg.left, y); ctx.lineTo(w - mg.right, y); ctx.stroke();
+        ctx.fillText((maxT - (maxT - minT) * i / 4).toFixed(0) + '°', mg.left - 6, y);
+    }
+    var n = historyData.length, xs = pw / (n - 1);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    var step = Math.max(1, Math.floor(n / 6));
+    historyData.forEach(function(d, i){
+        if(i % step === 0 || i === n - 1){
+            ctx.fillText(new Date(d.ts * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}),
+                         mg.left + i * xs, h - mg.bottom + 6);
+        }
+    });
+    function ty(t){ return mg.top + ph - (t - minT) / (maxT - minT) * ph; }
+    function sy(s){ return mg.top + ph - s / 255 * ph; }
+
+    // 温度：红色实线 + 淡红填充
+    var g = ctx.createLinearGradient(0, mg.top, 0, h - mg.bottom);
+    g.addColorStop(0, 'rgba(239,68,68,.16)'); g.addColorStop(1, 'rgba(239,68,68,0)');
+    ctx.beginPath();
+    historyData.forEach(function(d, i){ i ? ctx.lineTo(mg.left + i * xs, ty(d.control_temp)) : ctx.moveTo(mg.left, ty(d.control_temp)); });
+    ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.lineTo(mg.left + (n-1) * xs, h - mg.bottom); ctx.lineTo(mg.left, h - mg.bottom);
+    ctx.closePath(); ctx.fillStyle = g; ctx.fill();
+
+    // PWM：亮蓝色虚线（与温度实线区分开）
+    //
+    // 【为什么以前看着像实线】关键在 canvas 的规范细节：**setLineDash 的数组是
+    // 按 lineWidth 缩放的**（实际段长 = 数组值 × lineWidth / 2）。
+    // 旧代码用同一个 [7,5] 先后描了两遍：
+    //   外发光 lineWidth=5 → 实际虚线段被拉长到 ~17.5px，空隙 ~12.5px
+    //   主线   lineWidth=2.2 → 段长 ~7.7px，空隙 ~5.5px
+    // 两条线的**相位还各自从起点重算**，于是 5px 宽的发光层正好糊在主线空档上，
+    // 两者叠加后视觉上就是一条连续的粗蓝线 —— 怎么调颜色都「不虚」。
+    //
+    // 修法：发光层不再用虚线，改成**极低透明度的实线垫底**（负责“发光”观感），
+    // 虚线只由主线画一遍，段长干净可控。两者互不干扰，虚线才真的看得出来。
+    ctx.save();
+    ctx.beginPath();
+    historyData.forEach(function(d, i){ i ? ctx.lineTo(mg.left + i * xs, sy(d.speed)) : ctx.moveTo(mg.left, sy(d.speed)); });
+
+    // ① 发光垫底：实线、低透明、稍粗，只提供光晕，不参与“虚线”表达
+    ctx.setLineDash([]);
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(59,130,246,.14)'; ctx.lineWidth = 5.5; ctx.stroke();
+
+    // ② 主线：唯一的虚线层。段长放大到 9×6，在 2.2px 线宽下约 10px/7px，
+    //    远看清楚分明，又不会碎成点。
+    ctx.beginPath();
+    historyData.forEach(function(d, i){ i ? ctx.lineTo(mg.left + i * xs, sy(d.speed)) : ctx.moveTo(mg.left, sy(d.speed)); });
+    ctx.setLineDash([9, 6]);
+    ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2.2; ctx.stroke();
+    ctx.restore();
+    ctx.setLineDash([]);   // 复位，避免影响后续绘制
+
+    // 曲线末端小圆点，强化“这是转速百分比曲线”的观感
+    var li = n - 1;
+    ctx.beginPath();
+    ctx.arc(mg.left + li * xs, sy(historyData[li].speed), 3, 0, Math.PI * 2);
+    ctx.fillStyle = '#2563eb'; ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+}
+
+/* ---------- 风扇转子旋转（rAF 角速度积分）---------- */
+//
+// 【为什么不用 CSS animation】
+// 原来 .fan-rotor 用 animation:fc-spin，靠改 --fan-dur（animation-duration）变速。
+// 改 animation-duration 不会重启动画，但浏览器会拿「新时长」重新解释已流逝的
+// 时间，角度立刻跳一下 —— 每轮刷新只要 PWM 变了就顿一下，PWM 一次跳 8~17
+// （升速中很常见）时能跳 20°。
+//
+// 改成积分后：每帧按当前角速度累加角度。速度变了只是角速度变，
+// 角度本身连续，所以加减速都是平滑的，不会跳。
+var fanAngle = 0, fanLastT = 0, fanDur = 2.4, fanStopped = true;
+// 扇叶变彩虹色的阈值（百分比）。需求是「超过 PWM 80%」，所以判据用 pct > 80；
+// 若想让正好 80% 也触发，把 > 改成 >= 即可。
+var RAINBOW_PCT = 80;
+function fanSpin(t){
+    requestAnimationFrame(fanSpin);
+    var rotor = $('fanRotor');
+    if(!rotor) return;
+    var dt = fanLastT ? (t - fanLastT) / 1000 : 0;
+    fanLastT = t;
+    // 标签页切走再切回时 dt 会很大，钳住，否则会瞬间转一大圈
+    if(dt > 0.25) dt = 0.25;
+    if(fanStopped || fanDur <= 0) return;
+    fanAngle = (fanAngle + 360 * dt / fanDur) % 360;
+    // 用 CSS transform，旋转中心由 .fan-rotor 的 transform-origin 属性
+    // （值 36px 36px）+ transform-box:view-box 决定。
+    // 【不要用 rotor.setAttribute('transform','rotate(a 36 36)')】
+    // 那样会和 transform-origin 叠加成三维旋转，转子被甩出 SVG。
+    rotor.style.transform = 'rotate(' + fanAngle.toFixed(2) + 'deg)';
+}
+
+/* ---------- 启动 ---------- */
+buildRows();
+syncModeUI();
+syncSlider();
+syncExtras();
+checkGuardOrder();
+drawCurve();
+markDirty();
+// 首屏立刻拉一次，然后交给链式轮询自己续拍（见 syncPollRate / pollTick）。
+// 不再用 setInterval：节拍需要在「稳态 1 秒 / 渐入 250ms」之间切换。
+fetchData();
+pollTick();
+requestAnimationFrame(fanSpin);
+window.addEventListener('resize', drawChart);
+
+var _origUpdate = updateStatus;
+updateStatus = function(now, svc){ lastTemp = now.temp || 0; _origUpdate(now, svc); };
+</script>
+{% include('footer') -%}
