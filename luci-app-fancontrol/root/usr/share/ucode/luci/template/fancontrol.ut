@@ -8,7 +8,7 @@
 	let jarr = [];
 	for (let k, d in defs) {
 		let v = uci.get('fancontrol', 'main', k);
-		if (typeof(d) == 'string') {
+		if (type(d) == 'string') {
 			let s = (v == null || v == '') ? d : v;
 			let esc = replace(replace(replace(replace('' + s, /\\/g, '\\\\'), /"/g, '\\"'), /\n/g, '\\n'), /\r/g, '\\r');
 			push(jarr, k + ':"' + esc + '"');
@@ -523,7 +523,7 @@
 </div>
 
 <script>
-var INIT = { {{ join(jarr, ',') }} };
+var INIT = { {{ join(',', jarr) }} };
 var dataUrl = '{{ url("admin/system/fancontrol/data") }}';
 var saveUrl = '{{ url("admin/system/fancontrol/save") }}';
 // 【两级刷新率】慢档完全跟随固件的 interval 配置，不再硬钳下限。

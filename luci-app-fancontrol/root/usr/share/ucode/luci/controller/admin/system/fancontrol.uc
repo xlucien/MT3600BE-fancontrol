@@ -5,13 +5,20 @@
 'use strict';
 
 import { readfile, popen } from 'fs';
+import { cursor } from 'uci';
 
 const CONFIG = 'fancontrol';
 const SECTION = 'main';
 
+// 【坑】controller 里 uci 不是全局对象（只有在 .ut template 里才是）。
+// 必须显式 import { cursor } from 'uci' 再 cursor() 拿实例，
+// 否则 uci.get() 静默返回 null → config 段输出成 {"config":{null}}。
+const UC = cursor();
+
 // 取命令 stdout（stderr 丢弃）
+// 注意：ucode 的 popen 只接受 1 个参数（command），传模式参数会导致异常
 function shell_out(cmd) {
-	let fd = popen(cmd + ' 2>/dev/null', 'r');
+	let fd = popen(cmd + ' 2>/dev/null');
 	if (!fd)
 		return '';
 	let out = fd.read(65536) ?? '';
@@ -53,26 +60,46 @@ function read_int(path) {
 	return m ? +m[0] : null;
 }
 
+// 按行解析 key=value。
+// 【坑】不能用 match(raw, /pat/, off) 循环：ucode 的 match() 会忽略 offset 参数，
+// 每次都从头匹配，且 m.index 恒为 null —— 循环变量永不前进，直接死循环。
+// 改用 split(raw, "\n") 逐行 + split(line, "=") 取键值。
 function read_ramp() {
 	let raw = readfile('/tmp/fancontrol_ramp') ?? '';
 	let t = {};
-	let m;
-	let off = 0;
-	while ((m = match(raw, /(\w+)=(-?\d+)/, off)) != null) {
-		t[m[1]] = +m[2];
-		off = m.index + length(m[0]);
+	for (let line in split(raw, '\n')) {
+		let s = trim(line);
+		if (s == '')
+			continue;
+		let kv = split(s, '=');
+		if (length(kv) == 2)
+			t[kv[0]] = +kv[1];
 	}
 	return t;
 }
 
 function slog(msg) {
-	msg = ('' + (msg ?? '')).replace(/'/g, '').replace(/`/g, '').replace(/\$/g, '').replace(/"/g, '');
-	pcall(shell_rc, `logger -t fanctrl '${msg}'`);
+	// 【坑】ucode 的字符串不支持「方法调用」形式（msg.replace(...) 会抛
+	// "left-hand side expression is not an array or object"）。
+	// 必须用函数形式 replace(str, pat, repl)。
+	msg = '' + (msg ?? '');
+	msg = replace(msg, /'/g, '');
+	msg = replace(msg, /`/g, '');
+	msg = replace(msg, /\$/g, '');
+	msg = replace(msg, /"/g, '');
+	// 【坑】ucode 的 pcall() 不支持「函数名 + 参数」形式（会抛
+	// "left-hand side is not a function"）。这里用 try/catch 替代。
+	try {
+		shell_rc(`logger -t fanctrl '${msg}'`);
+	}
+	catch (e) {}
 }
 
 function uci_set(key, val) {
 	// val 已经过白名单/数值/时间格式校验，这里再做一次 shell 字符剔除
-	val = replace('' + val, /[^\w_.\-:]/g, '');
+	// 【坑】ucode 正则在排除字符类里不支持 \w（/[^\w_.\-:]/ 会把 "auto"
+	// 整个替换掉）。必须写成显式字符集。
+	val = replace('' + val, /[^0-9a-zA-Z_.:-]/g, '');
 	if (val == '')
 		return false;
 	let rc = shell_rc(`uci set ${CONFIG}.${SECTION}.${key}='${val}' >/dev/null 2>&1`);
@@ -131,7 +158,7 @@ function action_data() {
 	let cp = [];
 	for (let i = 0; i < length(keys); i++) {
 		let k = keys[i];
-		let v = uci.get('fancontrol', 'main', k) ?? '';
+		let v = UC.get('fancontrol', 'main', k) ?? '';
 		let n = +v;
 		if (n == n && n == v) {
 			// 数值：原样输出
@@ -179,7 +206,7 @@ function action_data() {
 		    ',"time":' + json_escape(time_now) + '},' +
 		'"service":{"pid":' + json_escape(pid) +
 		    ',"autostart":' + (autostart == '1' ? 'true' : 'false') + '},' +
-		'"config":{' + join(cp, ',') + '}' +
+		'"config":{' + join(',', cp) + '}' +
 		'}'
 	);
 }
@@ -199,12 +226,16 @@ function action_save() {
 	                'night_enabled','night_start','night_end','night_speed',
 	                'guard_enabled','guard_temp','guard_exit','guard_speed','ramp_up',
 	                'temp_smooth'];
+	// 诊断用：把任何异常都返回给调用方，避免只看到 500 空白页
+	try {
+
 	for (let i = 0; i < length(seenkeys); i++) {
 		let k = seenkeys[i];
 		let v = field(k);
-		push(seen, k + '=' + (v == null ? '-' : replace(v, /[^\w_.\-:]/g, '?')));
+		push(seen, k + '=' + (v == null ? '-' : replace(v, /[^0-9a-zA-Z_.:-]/g, '?')));
 	}
-	slog('SAVE ' + join(seen, ' '));
+
+	slog('SAVE ' + join(' ', seen));
 
 	let applied = 0;
 	let failed = [];
@@ -271,6 +302,7 @@ function action_save() {
 		}
 	}
 
+
 	// 开关
 	let swkeys = ['night_enabled', 'guard_enabled'];
 	for (let i = 0; i < length(swkeys); i++) {
@@ -309,7 +341,7 @@ function action_save() {
 		push(verify, json_escape(k) + ':' + json_escape(uci_get(k)));
 	}
 
-	slog(`SAVE-DONE applied=${applied} failed=${(length(failed) == 0 ? 'none' : join(failed, ','))} committed=${committed} mode=${uci_get('mode')} manual_speed=${uci_get('manual_speed')}`);
+	slog(`SAVE-DONE applied=${applied} failed=${(length(failed) == 0 ? 'none' : join(',', failed))} committed=${committed} mode=${uci_get('mode')} manual_speed=${uci_get('manual_speed')}`);
 
 	// 唤醒守护进程立刻重跑一轮，实现「保存后立即生效」
 	shell_rc('touch /tmp/fancontrol_reload >/dev/null 2>&1');
@@ -323,19 +355,26 @@ function action_save() {
 	http.write(
 		'{"status":"' + (committed ? 'ok' : 'commit_failed') +
 		'","applied":' + applied +
-		',"failed":' + json_escape(join(failed, ',')) +
+		',"failed":' + json_escape(join(',', failed)) +
 		',"warn":' + json_escape(warn) +
-		',"config":{' + join(verify, ',') + '}}'
+		',"config":{' + join(',', verify) + '}}'
 	);
+	}
+	catch (e) {
+		http.prepare_content('application/json');
+		http.write('{"status":"exception","msg":' + json_escape('' + e) +
+		           '}');
+	}
 }
 
+// 路由由 /usr/share/luci/menu.d/luci-app-fancontrol.json 声明（ucode LuCI 机制），
+// 不再用 Lua 的 entry() 注册：
+//   admin/system/fancontrol       -> view: fancontrol.ut
+//   admin/system/fancontrol/data  -> function: action_data
+//   admin/system/fancontrol/save  -> function: action_save (POST)
+// controller 路径 controller/admin/system/fancontrol.uc 对应 module
+// "luci.controller.admin.system.fancontrol"。
 return {
-	index: function() {
-		// 路由注册：entry / template / call 是 ucode luci dispatcher 提供的全局函数
-		entry({'admin', 'system', 'fancontrol'}, template('fancontrol'), _('风扇控制'), 60);
-		entry({'admin', 'system', 'fancontrol', 'data'}, call(action_data)).leaf = true;
-		entry({'admin', 'system', 'fancontrol', 'save'}, call(action_save)).leaf = true;
-	},
 	action_data: action_data,
 	action_save: action_save
 };
