@@ -209,6 +209,7 @@ luci-app-fancontrol/
 
 ## 近期更新
 
+- **页面迁移到 ucode**：controller + 模板全部改为 ucode（`/usr/share/ucode/luci/`），LuCI 主题外壳照常（argon 侧边栏/顶栏）。模板经 `dispatcher` 的 template action 渲染，作用域自带 `include()`/`media`/`resource`/`dispatcher`，但**没有** `url()`——所有地址用 `dispatcher.build_url()` 或写死路径。老 Lua 控制器与视图仍保留作回退
 - **手动 PWM 快捷键**：从 5 档（停转 / 超静音 20% / 静音 30% / 中速 50% / 全速 100%）精简为 4 档（停转 0% / 静音 30% / 中速 50% / 全速 100%），键改为统一圆角的钢琴键样式
 - **风扇转子 rAF 驱动**：以前靠 CSS `animation-duration` 变速，PWM 改一次角度就跳变；改为 `requestAnimationFrame` 角速度积分后，加减速全程平滑
 - **转速警戒配色**：手动 PWM > 80% 时五片扇叶依次染红/橙/黄/绿/蓝（轮毂转深灰），回落自动恢复蓝色。0.5s 平滑过渡，不会闪变
