@@ -1,0 +1,834 @@
+#!/bin/sh
+
+CONFIG="fancontrol"
+SECTION="main"
+HISTORY_FILE="/tmp/fancontrol_history.txt"
+# 最近一段渐入的起止时刻与耗时（秒），供页面显示「还要多久」。
+# 用文件而不是只塞进 history：页面刷新间隔最长可能有十几秒，
+# 靠轮询采样去推断剩余时间会严重失真，这里让 daemon 直接给出准确值。
+RAMP_FILE="/tmp/fancontrol_ramp"
+# 跨重启保存渐入进度（cur_speed）与守护闭锁（guard_active），
+# 否则 daemon 重启/保存热重载后渐入会从 -1 重置，转速直接跳变。
+STATE_FILE="/tmp/fancontrol_state"
+
+# ---------- 通用工具 ----------
+read_file() { [ -r "$1" ] && cat "$1" 2>/dev/null; }
+write_file() { [ -w "$1" ] && printf '%s\n' "$2" > "$1" 2>/dev/null; }
+is_uint() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+get_config() { local opt="$1" def="$2"; uci get "$CONFIG.$SECTION.$opt" 2>/dev/null || echo "$def"; }
+
+# ---------- hwmon / thermal 探测 ----------
+find_hwmon_by_name() {
+    local wanted="$1" dir name
+    for dir in /sys/class/hwmon/hwmon*; do
+        [ -d "$dir" ] || continue
+        name="$(read_file "$dir/name")"
+        [ "$name" = "$wanted" ] && { printf '%s' "$dir"; return 0; }
+    done
+    return 1
+}
+
+find_hwmon_by_name_contains() {
+    local pattern="$1" dir name
+    for dir in /sys/class/hwmon/hwmon*; do
+        [ -d "$dir" ] || continue
+        name="$(read_file "$dir/name")"
+        case "$name" in *$pattern*) { printf '%s' "$dir"; return 0; } ;; esac
+    done
+    return 1
+}
+
+find_thermal_by_type() {
+    local wanted="$1" dir type
+    for dir in /sys/class/thermal/thermal_zone*; do
+        [ -d "$dir" ] || continue
+        [ -r "$dir/type" ] || continue
+        type="$(read_file "$dir/type")"
+        [ "$type" = "$wanted" ] && { printf '%s' "$dir"; return 0; }
+    done
+    return 1
+}
+
+find_thermal_by_type_glob() {
+    local pattern="$1" dir type
+    for dir in /sys/class/thermal/thermal_zone*; do
+        [ -d "$dir" ] || continue
+        [ -r "$dir/type" ] || continue
+        type="$(read_file "$dir/type")"
+        case "$type" in $pattern) { printf '%s' "$dir"; return 0; } ;; esac
+    done
+    return 1
+}
+
+# CPU 温度路径
+cpu_temp_path() {
+    local path uci_path
+    uci_path="$(get_config temp_source "")"
+    if [ -n "$uci_path" ] && [ -r "$uci_path" ]; then
+        printf '%s' "$uci_path"; return 0
+    fi
+    path="$(find_hwmon_by_name cpu_thermal)"
+    [ -n "$path" ] && [ -r "$path/temp1_input" ] && { printf '%s' "$path/temp1_input"; return 0; }
+    [ -r /sys/class/thermal/thermal_zone0/temp ] && { printf '%s' /sys/class/thermal/thermal_zone0/temp; return 0; }
+    for dir in /sys/class/thermal/thermal_zone*; do
+        [ -r "$dir/temp" ] && { printf '%s' "$dir/temp"; return 0; }
+    done
+    return 1
+}
+
+temp_path_by_hwmon_name() {
+    local wanted="$1" dir
+    dir="$(find_hwmon_by_name "$wanted")"
+    [ -n "$dir" ] && [ -r "$dir/temp1_input" ] && printf '%s' "$dir/temp1_input"
+}
+
+temp_path_by_hwmon_contains() {
+    local pattern="$1" dir
+    dir="$(find_hwmon_by_name_contains "$pattern")"
+    [ -n "$dir" ] && [ -r "$dir/temp1_input" ] && printf '%s' "$dir/temp1_input"
+}
+
+temp_path_by_thermal_type() {
+    local wanted="$1" dir
+    dir="$(find_thermal_by_type "$wanted")"
+    [ -n "$dir" ] && [ -r "$dir/temp" ] && printf '%s' "$dir/temp"
+}
+
+# WiFi 温度路径
+wifi_temp_path() {
+    local idx="$1" path
+
+    if [ "$idx" = "0" ]; then
+        path="$(temp_path_by_hwmon_name "mt7996_phy0.0")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+        path="$(temp_path_by_hwmon_name "mt7990")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    else
+        path="$(temp_path_by_hwmon_name "mt7996_phy0.1")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    fi
+
+    if [ "$idx" = "0" ]; then
+        path="$(temp_path_by_hwmon_name "MT7993_1_1")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    else
+        path="$(temp_path_by_hwmon_name "MT7993_1_2")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    fi
+
+    if [ "$idx" = "0" ]; then
+        path="$(temp_path_by_hwmon_name "mt7993_ra0")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+        path="$(temp_path_by_hwmon_name "ra0")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    else
+        path="$(temp_path_by_hwmon_name "mt7993_rai0")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+        path="$(temp_path_by_hwmon_name "rai0")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    fi
+
+    path="$(temp_path_by_hwmon_name "mt7993")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    path="$(temp_path_by_hwmon_name "mtk_hwifi")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    path="$(temp_path_by_hwmon_name "mt_wifi")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+
+    path="$(temp_path_by_thermal_type "mt7993")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    path="$(temp_path_by_thermal_type "mtk_hwifi")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    path="$(temp_path_by_thermal_type "mt_wifi")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    path="$(temp_path_by_thermal_type "wifi")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    path="$(temp_path_by_thermal_type "wlphy")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+    path="$(temp_path_by_thermal_type "wlan")"; [ -n "$path" ] && { printf '%s' "$path"; return; }
+
+    path="$(find_thermal_by_type_glob "*wifi*")"; [ -n "$path" ] && [ -r "$path/temp" ] && { printf '%s' "$path/temp"; return; }
+    path="$(find_thermal_by_type_glob "*7993*")"; [ -n "$path" ] && [ -r "$path/temp" ] && { printf '%s' "$path/temp"; return; }
+    path="$(find_thermal_by_type_glob "*hwifi*")"; [ -n "$path" ] && [ -r "$path/temp" ] && { printf '%s' "$path/temp"; return; }
+
+    return 1
+}
+
+wifi_temp_by_mwctl() {
+    local wanted="$1" ifname temp
+    local mtwifi_vifs="ra0 rax0 rai0 ray0 rae0 raz0"
+
+    command -v mwctl >/dev/null 2>&1 || return 1
+
+    if [ -n "$wanted" ]; then
+        temp="$(mwctl "$wanted" stat 2>/dev/null | awk '/CurrentTemperature/ {print $3}')"
+        is_uint "$temp" && { printf '%s' $((temp * 1000)); return 0; }
+        return 1
+    fi
+
+    for ifname in $mtwifi_vifs; do
+        [ -f "/sys/class/net/${ifname}/flags" ] || continue
+        local flags
+        flags="$(cat "/sys/class/net/${ifname}/flags" 2>/dev/null)"
+        [ -n "$flags" ] && [ "$((flags & 0x1))" -eq "1" ] || continue
+        temp="$(mwctl "$ifname" stat 2>/dev/null | awk '/CurrentTemperature/ {print $3}')"
+        is_uint "$temp" && { printf '%s' $((temp * 1000)); return 0; }
+    done
+    return 1
+}
+
+wifi_temp_read() {
+    local idx="$1" path value
+
+    path="$(wifi_temp_path "$idx")"
+    if [ -n "$path" ]; then
+        value="$(read_file "$path")"
+        if is_uint "$value" && [ "$value" -le 150000 ]; then
+            printf '%s' "$value"
+            return 0
+        fi
+    fi
+
+    local ifname
+    if [ "$idx" = "0" ]; then
+        for ifname in ra0 rax0; do
+            value="$(wifi_temp_by_mwctl "$ifname")"
+            [ -n "$value" ] && { printf '%s' "$value"; return 0; }
+        done
+    else
+        for ifname in rai0 ray0; do
+            value="$(wifi_temp_by_mwctl "$ifname")"
+            [ -n "$value" ] && { printf '%s' "$value"; return 0; }
+        done
+    fi
+
+    value="$(wifi_temp_by_mwctl)"
+    [ -n "$value" ] && { printf '%s' "$value"; return 0; }
+
+    return 1
+}
+
+# ---------- 风扇硬件探测 ----------
+fan_hwmon_dir() {
+    local dir
+    dir="$(find_hwmon_by_name pwmfan)"
+    [ -n "$dir" ] && [ -e "$dir/pwm1" ] && { printf '%s' "$dir"; return; }
+
+    for dir in /sys/class/hwmon/hwmon*; do
+        [ -e "$dir/pwm1" ] && [ -e "$dir/fan1_input" ] && { printf '%s' "$dir"; return; }
+    done
+
+    for dir in /sys/class/hwmon/hwmon*; do
+        [ -e "$dir/pwm1" ] && { printf '%s' "$dir"; return; }
+    done
+}
+
+pwm_path() {
+    local dir
+    dir="$(fan_hwmon_dir)"
+    [ -n "$dir" ] && [ -e "$dir/pwm1" ] && printf '%s' "$dir/pwm1"
+}
+
+pwm_enable_path() {
+    local dir
+    dir="$(fan_hwmon_dir)"
+    [ -n "$dir" ] && [ -e "$dir/pwm1_enable" ] && printf '%s' "$dir/pwm1_enable"
+}
+
+rpm_path() {
+    local dir
+    dir="$(fan_hwmon_dir)"
+    [ -n "$dir" ] && [ -e "$dir/fan1_input" ] && printf '%s' "$dir/fan1_input"
+}
+
+set_all_thermal_policy() {
+    local policy="$1"
+    local dir
+    for dir in /sys/class/thermal/thermal_zone*; do
+        [ -d "$dir" ] || continue
+        [ -w "$dir/policy" ] && write_file "$dir/policy" "$policy" || true
+    done
+}
+
+# 内核 thermal governor（step_wise）会周期性改写 pwm-fan cooling state，与插件抢风扇，
+# 导致手动 0 被内核拉起。接管模式下关闭 zone 轮询，让插件成为风扇唯一写入者；
+# system 模式交还内核时恢复 enabled。
+set_zones_polling() {
+    local state="$1" dir
+    for dir in /sys/class/thermal/thermal_zone*; do
+        [ -e "$dir/mode" ] && write_file "$dir/mode" "$state" || true
+    done
+}
+
+# HH:MM -> 当日分钟数（必须去掉前导 0，否则 0700 会被 shell 当成八进制算成 448）
+hm2min() {
+    local v h m
+    v="$(printf '%s' "$1" | tr -dc '0-9')"
+    v="${v#"${v%%[!0]*}"}"
+    [ -z "$v" ] && v=0
+    h=$(( v / 100 ))
+    m=$(( v % 100 ))
+    printf '%d' $(( h * 60 + m ))
+}
+
+# 夜间窗口判断，start/end 为 HH:MM，支持跨天（如 23:00 -> 07:00）
+in_night_window() {
+    local s e n
+    s="$(hm2min "$1")"
+    e="$(hm2min "$2")"
+    n="$(hm2min "$(date +%H:%M)")"
+    if [ "$s" -le "$e" ]; then
+        [ "$n" -ge "$s" ] && [ "$n" -lt "$e" ]
+    else
+        [ "$n" -ge "$s" ] || [ "$n" -lt "$e" ]
+    fi
+}
+
+cooling_state_path() {
+    local dir type
+    for dir in /sys/class/thermal/cooling_device*; do
+        [ -r "$dir/type" ] || continue
+        type="$(read_file "$dir/type")"
+        [ "$type" = "pwm-fan" ] && { printf '%s' "$dir/cur_state"; return 0; }
+    done
+    return 1
+}
+
+set_manual_control() {
+    set_zones_polling disabled
+    set_all_thermal_policy user_space
+    local path
+    path="$(pwm_enable_path)"
+    [ -n "$path" ] && write_file "$path" 1 || true
+}
+
+set_system_control() {
+    set_zones_polling enabled
+    set_all_thermal_policy step_wise
+    local path
+    path="$(pwm_enable_path)"
+    [ -n "$path" ] && write_file "$path" 2 || true
+    local cpath cstate
+    cpath="$(cooling_state_path)"
+    if [ -n "$cpath" ]; then
+        cstate="$(read_file "$cpath")"
+        if is_uint "$cstate"; then
+            write_file "$cpath" "$cstate" || true
+        fi
+    fi
+}
+
+# ---------- 温度读取 ----------
+read_temp_c() {
+    local path="$1" raw
+    raw="$(read_file "$path")"
+    [ -z "$raw" ] && return 1
+    raw="$(echo "$raw" | tr -dc '0-9')"
+    [ -z "$raw" ] && return 1
+    if [ "$raw" -gt 1000 ]; then
+        awk -v v="$raw" 'BEGIN {printf "%.1f", v/1000}'
+    else
+        printf '%s' "$raw"
+    fi
+    return 0
+}
+
+# ========== 主循环 ==========
+enabled=$(get_config enabled 1)
+[ "$enabled" != "1" ] && exit 0
+
+temp_source_uci=$(get_config temp_source "")
+pwm_control_uci=$(get_config pwm_control "")
+pwm_enable_uci=$(get_config pwm_enable "")
+interval=$(get_config interval 1)
+mode=$(get_config mode auto)
+manual_speed=$(get_config manual_speed 128)
+auto_temp_low=$(get_config auto_temp_low 50)
+auto_temp_mid=$(get_config auto_temp_mid 60)
+auto_temp_high=$(get_config auto_temp_high 75)
+auto_pwm_low=$(get_config auto_pwm_low 50)
+auto_pwm_mid=$(get_config auto_pwm_mid 128)
+auto_pwm_high=$(get_config auto_pwm_high 255)
+min_temp=$(get_config min_temp 40)
+max_temp=$(get_config max_temp 70)
+min_speed=$(get_config min_speed 50)
+max_speed=$(get_config max_speed 255)
+history_size=$(get_config history_size 60)
+
+CPU_TEMP_PATH="$(cpu_temp_path)"
+WIFI0_TEMP_PATH="$(wifi_temp_path 0)"
+WIFI1_TEMP_PATH="$(wifi_temp_path 1)"
+ETH_TEMP_PATH="$(temp_path_by_hwmon_name 'mdio_bus:07')"
+
+if [ -n "$pwm_control_uci" ] && [ -e "$pwm_control_uci" ]; then
+    PWM_CONTROL="$pwm_control_uci"
+else
+    PWM_CONTROL="$(pwm_path)"
+fi
+
+if [ -n "$pwm_enable_uci" ] && [ -e "$pwm_enable_uci" ]; then
+    PWM_ENABLE="$pwm_enable_uci"
+else
+    PWM_ENABLE="$(pwm_enable_path)"
+fi
+
+FAN_SPEED_SOURCE=$(get_config fan_speed_source "")
+if [ -z "$FAN_SPEED_SOURCE" ] || [ ! -e "$FAN_SPEED_SOURCE" ]; then
+    FAN_SPEED_SOURCE="$(rpm_path)"
+fi
+
+logger -t fancontrol "daemon started (pid $$) mode=$mode interval=${interval}s"
+
+case "$mode" in
+    system) set_system_control ;;
+    auto|auto_curve|manual) set_manual_control ;;
+esac
+
+: > "$HISTORY_FILE"
+
+while true; do
+    # ---- 配置读取（带缓存）----
+    #
+    # 每轮无条件重读 22 项配置的话，就是每轮 22 次 fork+exec uci 进程 —— 这是本
+    # 守护进程开销的大头（实测 1.5 秒一轮，约 27 次 fork/秒）。但配置几乎从不变，
+    # 所以改成只在下面三种情况才真读：
+    #   ① 首次进入循环
+    #   ② 出现 /tmp/fancontrol_reload（页面点「保存并生效」时写入）→ 1 秒内生效
+    #   ③ 兜底周期 CFG_REFRESH 秒 → 覆盖 ssh 里直接 uci set 这类没写标志文件的场景
+    # 对外行为不变：改动依然无需重启服务。
+    now_s=$(date +%s)
+    cfg_dirty=0
+    if [ -z "$CFG_LOADED_AT" ]; then
+        cfg_dirty=1
+    elif [ -e /tmp/fancontrol_reload ]; then
+        rm -f /tmp/fancontrol_reload
+        cfg_dirty=1
+    elif [ $(( now_s - CFG_LOADED_AT )) -ge "${CFG_REFRESH:-5}" ]; then
+        cfg_dirty=1
+    fi
+
+    if [ "$cfg_dirty" = "1" ]; then
+        mode=$(get_config mode auto)
+        manual_speed=$(get_config manual_speed 128)
+        auto_temp_low=$(get_config auto_temp_low 50)
+        auto_temp_mid=$(get_config auto_temp_mid 60)
+        auto_temp_high=$(get_config auto_temp_high 75)
+        auto_pwm_low=$(get_config auto_pwm_low 50)
+        auto_pwm_mid=$(get_config auto_pwm_mid 128)
+        auto_pwm_high=$(get_config auto_pwm_high 255)
+        min_temp=$(get_config min_temp 40)
+        max_temp=$(get_config max_temp 70)
+        min_speed=$(get_config min_speed 50)
+        max_speed=$(get_config max_speed 255)
+        night_enabled=$(get_config night_enabled 0)
+        night_start=$(get_config night_start 23:00)
+        night_end=$(get_config night_end 07:00)
+        night_speed=$(get_config night_speed 0)
+        guard_enabled=$(get_config guard_enabled 1)
+        guard_temp=$(get_config guard_temp 90)
+        guard_exit=$(get_config guard_exit 80)
+        guard_speed=$(get_config guard_speed 178)
+        ramp_up=$(get_config ramp_up 30)
+        # 控制温度的平滑窗口（秒）。0 = 关闭平滑。
+        # 默认 5 秒：MT798x 传感器噪声约 ±1.9°C，经曲线增益放大后会让目标每秒都变，
+        # 不做平滑的话 PWM 会持续摆动（详见下方「控制温度指数平滑」注释）。
+        temp_smooth=$(get_config temp_smooth 5)
+        # 历史长度也放进缓存块，这样改了不必重启服务才生效
+        history_size=$(get_config history_size 60)
+        CFG_LOADED_AT=$now_s
+    fi
+    # 守护状态跨轮保持（触发温度与退出温度之间的区间保持原状，避免抖动）
+    # 优先从状态文件恢复，保证 daemon 重启后闭锁状态不丢
+    if [ -r "$STATE_FILE" ]; then
+        . "$STATE_FILE" 2>/dev/null
+    fi
+    guard_active=${guard_active:-0}
+    # 渐入用的当前输出转速，-1 表示未初始化（首轮直接到位，不做渐入）
+    # 从状态文件恢复可让「保存并生效」触发的热重载不打断正在进行的渐入
+    cur_speed=${cur_speed:--1}
+    # 渐入插值状态：起点值 / 目标值 / 起点时刻（秒）
+    ramp_from=${ramp_from:--1}
+    ramp_to=${ramp_to:--1}
+    ramp_start=${ramp_start:-0}
+    reason=$mode
+    in_night=0
+
+    cpu_temp_c=""
+    wifi0_temp_c=""
+    wifi1_temp_c=""
+    eth_temp_c=""
+    control_temp_c=""
+
+    if [ -n "$CPU_TEMP_PATH" ] && [ -r "$CPU_TEMP_PATH" ]; then
+        cpu_temp_c="$(read_temp_c "$CPU_TEMP_PATH")"
+    fi
+    if [ -n "$WIFI0_TEMP_PATH" ] && [ -r "$WIFI0_TEMP_PATH" ]; then
+        wifi0_temp_c="$(read_temp_c "$WIFI0_TEMP_PATH")"
+    else
+        value="$(wifi_temp_read 0)"
+        [ -n "$value" ] && wifi0_temp_c="$(awk -v v="$value" 'BEGIN {printf "%.1f", v/1000}')"
+    fi
+    if [ -n "$WIFI1_TEMP_PATH" ] && [ -r "$WIFI1_TEMP_PATH" ]; then
+        wifi1_temp_c="$(read_temp_c "$WIFI1_TEMP_PATH")"
+    else
+        value="$(wifi_temp_read 1)"
+        [ -n "$value" ] && wifi1_temp_c="$(awk -v v="$value" 'BEGIN {printf "%.1f", v/1000}')"
+    fi
+    if [ -n "$ETH_TEMP_PATH" ] && [ -r "$ETH_TEMP_PATH" ]; then
+        eth_temp_c="$(read_temp_c "$ETH_TEMP_PATH")"
+    fi
+
+    control_temp_c="0"
+    for temp in "$cpu_temp_c" "$wifi0_temp_c" "$wifi1_temp_c" "$eth_temp_c"; do
+        [ -n "$temp" ] && control_temp_c=$(awk -v cur="$control_temp_c" -v new="$temp" 'BEGIN {if (new+0 > cur+0) printf "%.1f", new; else printf "%.1f", cur}')
+    done
+
+    # ===== 控制温度指数平滑 =====
+    # MT798x 的片上传感器噪声很大：实测同一秒内 tz0 在 60.9~62.7°C 之间跳，
+    # hwmon0(CPU) 更夸张，59.4~62.6°C（±1.6°C）；再叠上这里「取多个传感器最大值」
+    # 的策略，等于专门挑最抖的那个峰值，合成后抖动约 ±1.9°C。
+    #
+    # 噪声经曲线增益放大后非常致命：当前曲线 (255-50)/(70-40) = 6.83 PWM/°C，
+    # 1.9°C 抖动就是 13 个 PWM 的目标摆动。目标每秒都变，渐入就永远走不完。
+    #
+    # 所以取完最大值后再做一次一阶低通（EMA）：
+    #     T_ema = T_ema + α * (T_raw - T_ema),   α = interval / temp_smooth
+    # α = 1/5 表示约 5 秒窗口，噪声可压到约 ±0.5°C，真实温度变化约 5 秒内跟上。
+    # 散热是慢过程，这点延迟无感，但足以让目标值稳定下来。
+    #
+    # temp_ema 会写进状态文件，daemon 重启（含保存热重载）后接着平滑，不会跳变。
+    # temp_smooth=0 表示关闭平滑（退回原始值，供调试对比用）。
+    if [ -n "$control_temp_c" ]; then
+        if is_uint "$temp_smooth" && [ "$temp_smooth" -gt 0 ] && is_uint "$interval" && [ "$interval" -gt 0 ]; then
+            if [ -n "$temp_ema" ]; then
+                control_temp_c=$(awk -v p="$temp_ema" -v n="$control_temp_c" -v i="$interval" -v w="$temp_smooth" \
+                    'BEGIN{ a = i / w; if (a > 1) a = 1; if (a < 0.01) a = 0.01
+                            printf "%.1f", p + a * (n - p) }')
+            fi
+        fi
+        temp_ema=$control_temp_c
+    fi
+
+    fan_rpm=""
+    if [ -n "$FAN_SPEED_SOURCE" ] && [ -r "$FAN_SPEED_SOURCE" ]; then
+        fan_rpm=$(head -n1 "$FAN_SPEED_SOURCE" 2>/dev/null | tr -dc '0-9')
+    fi
+    [ -z "$fan_rpm" ] && fan_rpm=0
+
+    speed=0
+    target_speed=0
+    case "$mode" in
+        system)
+            if [ -n "$PWM_CONTROL" ] && [ -r "$PWM_CONTROL" ]; then
+                speed=$(head -n1 "$PWM_CONTROL" 2>/dev/null | tr -dc '0-9')
+                [ -z "$speed" ] && speed=0
+            fi
+            target_speed=$speed
+            set_system_control
+            ;;
+        auto)
+            # 自动温控：低温以下停转，低温~中温低速，中温~高温中速，高温以上高速
+            speed=$(awk -v t="$control_temp_c" \
+                         -v low="$auto_temp_low" -v mid="$auto_temp_mid" -v high="$auto_temp_high" \
+                         -v pwm_low="$auto_pwm_low" -v pwm_mid="$auto_pwm_mid" -v pwm_high="$auto_pwm_high" \
+                'BEGIN{
+                    if (t+0 < low+0) {
+                        print 0;
+                    } else if (t+0 < mid+0) {
+                        print pwm_low;
+                    } else if (t+0 < high+0) {
+                        print pwm_mid;
+                    } else {
+                        print pwm_high;
+                    }
+                }')
+            [ -z "$speed" ] && speed=0
+            [ "$speed" -lt 0 ] && speed=0
+            [ "$speed" -gt 255 ] && speed=255
+            target_speed=$speed
+            # 这里不再写 PWM：此处能给的只是「目标值」，紧接着的渐入块会用
+            # 「渐入中的实际值」再写一次并覆盖它。留着只是每轮多一次 sysfs 写、
+            # 多一次 set_manual_control（它会遍历所有 thermal_zone 写 mode/policy）。
+            ;;
+        auto_curve)
+            # 自动曲线：线性插值
+            speed=$(awk -v t="$control_temp_c" -v mn="$min_temp" -v mx="$max_temp" \
+                         -v ms="$min_speed" -v xs="$max_speed" \
+                'BEGIN {
+                    if (t+0 <= mn+0) sp = ms;
+                    else if (t+0 >= mx+0) sp = xs;
+                    else sp = ms + (xs - ms) * (t - mn) / (mx - mn);
+                    printf "%d", sp;
+                }')
+            [ -z "$speed" ] && speed=$min_speed
+            [ "$speed" -lt 0 ] && speed=0
+            [ "$speed" -gt 255 ] && speed=255
+            target_speed=$speed
+            # 不写 PWM，理由同 auto 分支
+            ;;
+        manual)
+            speed=$manual_speed
+            [ "$speed" -lt 0 ] && speed=0
+            [ "$speed" -gt 255 ] && speed=255
+            target_speed=$speed
+            # 不写 PWM，理由同 auto 分支
+            ;;
+    esac
+
+    # ===== 夜间模式 / 温度守护 =====
+    # 优先级：温度守护 > 夜间模式 > 常规模式（system 模式不干预）
+    if [ "$mode" != "system" ]; then
+        if [ "$night_enabled" = "1" ]; then
+            in_night_window "$night_start" "$night_end" && in_night=1
+        fi
+
+        if [ "$guard_enabled" = "1" ] && is_uint "$guard_temp" && [ -n "$control_temp_c" ]; then
+            # 【退出温度必须低于触发温度，否则会出现永久闭锁死区】
+            # 若 guard_exit >= guard_temp，温度落在 [guard_temp, guard_exit] 区间时：
+            #   触发条件成立 → guard_active=1
+            #   退出条件也成立（t <= guard_exit）→ 但 elif 分支不会被求值，
+            #   于是闭锁永远保持，风扇卡在守护转速全速转，直到温度掉到 guard_temp 以下。
+            # 前端虽然有顺序校验，但只给 warn、不阻止保存，uci 也可能被手改，
+            # 所以这里强制夹住：exit 最多取 guard_temp - 1，保证必然存在退出点。
+            ge="$guard_exit"
+            if ! is_uint "$ge" || [ "$ge" -ge "$guard_temp" ]; then
+                ge=$(( guard_temp - 1 ))
+                [ "$ge" -lt 0 ] && ge=0
+            fi
+
+            if awk -v t="$control_temp_c" -v g="$guard_temp" 'BEGIN {exit !(t+0 >= g+0)}'; then
+                guard_active=1
+            elif awk -v t="$control_temp_c" -v e="$ge" 'BEGIN {exit !(t+0 <= e+0)}'; then
+                guard_active=0
+            fi
+        else
+            guard_active=0
+        fi
+
+        if [ "$guard_active" = "1" ]; then
+            speed=$guard_speed
+            # guard_speed 若被配成空值/非数字（手改配置文件、写入失败等），
+            # 直接用会让下面 [ "$speed" -lt 0 ] 报 "integer expression expected"，
+            # 且写 PWM 会失败 —— 守护触发了风扇反而不转，是最危险的失效方向。
+            # 退到满速 255：守护的本意是「过热时强制散热」，宁可吵也不能停。
+            is_uint "$speed" || speed=255
+            reason=guard
+        elif [ "$in_night" = "1" ]; then
+            speed=$night_speed
+            # 夜间转速同理，非法值退到 0（夜间本意是安静，退 0 比乱转更符合预期）
+            is_uint "$speed" || speed=0
+            reason=night
+        fi
+
+        [ "$speed" -lt 0 ] && speed=0
+        [ "$speed" -gt 255 ] && speed=255
+        # 规则算出的最终目标值，先存下来；页面据此区分「目标」与「渐入中的实际」
+        target_speed=$speed
+
+        # 转速渐入：无论升速还是降速都平滑过渡。
+        #
+        # 【恒定斜率，不再记起点时刻】
+        #
+        # 旧实现是「记 ramp_from/ramp_start，按 elapsed/dur 线性插值」，并且
+        # 一旦目标变化就重置 ramp_start。这在温度稳定时没问题，但实测：
+        # 传感器噪声 ±1.9°C × 曲线增益 6.83 PWM/°C → 目标每秒都在变
+        # （30 秒内目标变了 30 次），于是每轮都命中重置分支：
+        #       ramp_start = now  →  elapsed = 0  →  插值结果 = ramp_from
+        # PWM 一步都走不出去，全程卡死在 187 纹丝不动。
+        #
+        # 改成「每拍朝目标走固定步长」后不存在「重置」这个概念：
+        # 目标随时可变、方向随时可改，已走过的进度永不丢失。
+        #
+        # 斜率 = 满量程 255 / ramp_up 秒（ramp_up=30 时约 8.5 PWM/秒、3.3%/秒），
+        # 这与旧公式 dur = ramp_up*|Δ|/255 在数学上等价 —— 那个公式本身就是恒定斜率，
+        # 只是实现方式绕了一圈、且绕的那圈踩了坑。
+        #
+        # 步长按「本拍真实时长 dt」折算（见下方 dt 的计算），所以平均斜率
+        # 既与采样间隔无关，也与循环体自身的开销无关。
+        # busybox 的 sleep 只接受整数秒（无 usleep、无 read -t 小数），
+        # 做不到亚秒细分；但 PWM 驱动的是物理风扇本身带惯性，1 秒一档足够平滑，
+        # 「看着流畅」由页面侧 250ms 快档插值负责。
+        # 本拍真实时长。循环体本身有开销（十来次 awk + 若干 sysfs 读），
+        # 实测周期约 1.5 秒而不是配置里的 1 秒 —— 若按 $interval 折算步长，
+        # 实际斜率只有配置值的六成，ramp_up=30 会变成实际近 50 秒走完全程，
+        # 页面显示的「约 N 秒到位」也会明显偏短。改成按真实 dt 折算后，
+        # 斜率恒等于 255/ramp_up，与循环开销解耦，剩余秒数也准了。
+        # dt 上限 5 秒：万一 daemon 被挂起过久，也不至于一拍跳完全程。
+        # now_s 复用循环开头取到的时间戳，同一轮内差不到 1 秒，够用且省一次 fork。
+        dt=$interval
+        if [ -n "$last_tick_s" ]; then
+            dt=$(( now_s - last_tick_s ))
+            [ "$dt" -lt 1 ] && dt=1
+            [ "$dt" -gt 5 ] && dt=5
+        fi
+        last_tick_s=$now_s
+
+        if [ "$cur_speed" -lt 0 ]; then
+            # 首轮直接到位，避免开机时从 0 慢慢爬
+            cur_speed=$speed
+            ramp_from=-1
+            ramp_to=-1
+            ramp_start=0
+            ramp_dur=0
+        elif is_uint "$ramp_up" && [ "$ramp_up" -gt 0 ] && is_uint "$interval" && [ "$interval" -gt 0 ]; then
+            if [ "$speed" -ne "$cur_speed" ]; then
+                prev_speed=$cur_speed
+                cur_speed=$(awk -v c="$cur_speed" -v t="$speed" -v a="$ramp_up" -v tk="$dt" \
+                    'BEGIN{
+                        d = t - c
+                        if (d == 0) { printf "%d", c; exit }
+                        s = (d > 0) ? 1 : -1
+                        if (d < 0) d = -d
+                        rps = 255 / a                # 每秒斜率（PWM/秒）
+                        need = d / rps               # 走完还需要的秒数
+                        # 太小的改动也铺成约 2 秒：否则 1% 的调整一个周期就跳完，
+                        # 页面完全看不到过程。
+                        # 注意这里用的是「时间」而不是「拍数」—— 循环周期在 1~2 秒
+                        # 之间抖动，按拍数算会让步长跟着忽大忽小。
+                        if (need < 2) need = 2
+                        step = int(d * tk / need)    # 本拍走掉 need 时间里的 tk 份额
+                        if (step < 1) step = 1
+                        if (step > d) step = d       # 不许越过目标
+                        printf "%d", c + s * step }')
+
+                if [ "$cur_speed" -eq "$speed" ]; then
+                    # 本拍已到位
+                    ramp_from=-1
+                    ramp_to=-1
+                    ramp_start=0
+                    ramp_dur=0
+                else
+                    # 进度条锚点：本段渐入的起点 PWM。
+                    # 只有「上一段已结束」或「行进方向反转」才重设锚点；
+                    # 目标小幅移动不重设，否则进度条会来回跳。
+                    if [ "$ramp_from" -lt 0 ] 2>/dev/null || [ "$ramp_to" -lt 0 ] 2>/dev/null; then
+                        ramp_from=$prev_speed
+                    elif awk -v f="$ramp_from" -v o="$ramp_to" -v n="$speed" \
+                        'BEGIN{ a = o - f; b = n - f
+                                # 只有「严格同向」才保留锚点；反向、或任一为 0 都重设。
+                                # b == 0（新目标正好等于锚点）必须重设：否则 to == from，
+                                # 距离算成 0、dur 被压到最小值 2 秒，剩余时间全程显示 2 秒。
+                                # 真实场景：从 245 往下降到 20 的途中把目标改回 245，
+                                # 锚点还停在上一段的 245，就会出现这个退化。
+                                if ((a > 0 && b > 0) || (a < 0 && b < 0)) exit 1
+                                exit 0 }'; then
+                        ramp_from=$prev_speed
+                    fi
+                    ramp_to=$speed
+                    # 全程预计秒数 = |to - from| / 斜率，取整秒且至少 1 秒。
+                    # 必须是整数：控制器解析 ramp 文件用的是 (%w+)=(%-?%d+)，
+                    # 小数会被截断（"3.8" 只认成 3），这里直接给整数更可控。
+                    ramp_dur=$(awk -v f="$ramp_from" -v t="$speed" -v a="$ramp_up" \
+                        'BEGIN{ s = t - f; if (s < 0) s = -s
+                                r = 255 / a
+                                d = int(s / r); if (d < 2) d = 2
+                                printf "%d", d }')
+                    # start 是**反推合成值**，不是真实起点时刻。
+                    # 控制器按 remain = start + dur - now 计算剩余秒数，
+                    # 令其正好等于「从当前位置按斜率还要走多久」= (1 - 已完成比例) × dur，
+                    # 于是页面进度条按 PWM 实际位置推进，剩余秒数也准确。
+                    ramp_start=$(awk -v n="$now_s" -v f="$ramp_from" -v c="$cur_speed" -v t="$speed" -v dd="$ramp_dur" \
+                        'BEGIN{ s = t - f; if (s < 0) s = -s
+                                if (s == 0) { printf "%d", n; exit }
+                                done = (c - f) / (t - f)
+                                if (done < 0) done = 0; if (done > 1) done = 1
+                                printf "%d", n - int(done * dd) }')
+                fi
+            else
+                # 已到位：清空渐入状态，恢复正常轮询
+                cur_speed=$speed
+                ramp_from=-1
+                ramp_to=-1
+                ramp_start=0
+                ramp_dur=0
+            fi
+        else
+            # ramp_up=0（关闭渐入）或参数非法：直接到位
+            cur_speed=$speed
+            ramp_from=-1
+            ramp_to=-1
+            ramp_start=0
+            ramp_dur=0
+        fi
+        speed=$cur_speed
+
+        # ---- 接管设置 + 写 PWM（节流 + 去重）----
+        #
+        # set_manual_control 会遍历所有 thermal_zone 写 mode/policy、再写 pwm_enable。
+        # 每轮都做纯属浪费（值根本没变），但也不能完全不做：内核或其他进程有可能
+        # 把它们改回去。折中：运行模式切换时立刻做一次，另外每 30 秒兜底做一次。
+        force_hw=0
+        if [ -z "$last_ctl_at" ] || [ "$mode" != "$last_ctl_mode" ] \
+           || [ $(( now_s - last_ctl_at )) -ge 30 ]; then
+            set_manual_control
+            last_ctl_mode=$mode
+            last_ctl_at=$now_s
+            force_hw=1
+        fi
+
+        # PWM 值没变就不写：稳态下每轮都能省掉一次 sysfs 写。
+        # force_hw 时强制补写一次，兜住「被别人改写过」的情况。
+        if [ "$speed" != "$last_pwm_written" ] || [ "$force_hw" = "1" ]; then
+            if [ -n "$PWM_CONTROL" ] && [ -e "$PWM_CONTROL" ]; then
+                echo "$speed" > "$PWM_CONTROL" 2>/dev/null
+            else
+                PWM_CONTROL="$(pwm_path)"
+                if [ -n "$PWM_CONTROL" ] && [ -e "$PWM_CONTROL" ]; then
+                    echo "$speed" > "$PWM_CONTROL" 2>/dev/null
+                fi
+            fi
+            last_pwm_written=$speed
+        fi
+    fi
+
+    # 时间戳复用循环开头那个 now_s，省两次 date 的 fork
+    echo "$now_s,$control_temp_c,$cpu_temp_c,$wifi0_temp_c,$wifi1_temp_c,$eth_temp_c,$speed,$mode,$fan_rpm,$reason,$in_night,$guard_active,$target_speed" >> "$HISTORY_FILE"
+
+    # 历史裁剪节流：每轮 tail + mv 会把整个文件重写一遍，稳态下毫无必要。
+    # 攒到 history_size + 30 行再裁一次；多出来的几十行不影响展示 ——
+    # 页面本来就只取末尾 N 条来画图。
+    hist_limit=$(( ${history_size:-60} + 30 ))
+    hist_n=$(( ${hist_n:-0} + 1 ))
+    if [ "$hist_n" -ge "$hist_limit" ]; then
+        tail -n "${history_size:-60}" "$HISTORY_FILE" > "${HISTORY_FILE}.tmp"
+        mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
+        hist_n=${history_size:-60}
+    fi
+
+    # 落盘渐入/守护状态，供 daemon 重启（含保存热重载）后接着跑
+    printf 'cur_speed=%s\nguard_active=%s\nramp_from=%s\nramp_to=%s\nramp_start=%s\ntemp_ema=%s\n' \
+        "$cur_speed" "$guard_active" "$ramp_from" "$ramp_to" "$ramp_start" "$temp_ema" > "$STATE_FILE" 2>/dev/null
+
+    # 渐入进度单独落盘：页面每次采样都能拿到准确的起止时刻与总时长，
+    # 不用靠轮询采样去反推（刷新间隔远大于 1 秒，反推必然不准）。
+    now_stamp=$now_s
+    if [ "$ramp_from" -ge 0 ] 2>/dev/null; then
+        printf 'active=1\nfrom=%s\nto=%s\nstart=%s\ndur=%s\nnow=%s\n' \
+            "$ramp_from" "$ramp_to" "$ramp_start" "$ramp_dur" "$now_stamp" > "$RAMP_FILE" 2>/dev/null
+    else
+        printf 'active=0\nfrom=%s\nto=%s\nstart=%s\ndur=0\nnow=%s\n' \
+            "$cur_speed" "$cur_speed" "$now_stamp" "$now_stamp" > "$RAMP_FILE" 2>/dev/null
+    fi
+
+    # ---- 本轮结束到下一轮之间要等多久 ----
+    #
+    # 稳态用 $interval；**渐入期间固定 1 秒**（下面单独处理）—— 渐入时若也等 2 秒，
+    # 一步就是 17 个 PWM，风扇会有明显的台阶感；而且剩余秒数会按 2 秒一跳。
+    #
+    # 为什么不做到 250ms：这台固件把亚秒等待全裁了 ——
+    #   sleep 0.25    → "invalid number '0.25'"
+    #   read -t 0.25  → "invalid timeout"
+    #   usleep        → 没有这个 applet
+    # 唯一能凑出亚秒的办法是忙等，实测 250ms 要吃掉 4 jiffies(40ms) ≈ 16% 单核，
+    # 对一台 7×24 跑的路由器来说完全不划算。
+    # 而且 PWM 驱动的是物理风扇，本身带惯性；
+    # 「看着流畅」由页面侧负责：页面快档 250ms 拉一次数据，进度条和剩余秒数
+    # 是按服务端快照插值画的，与本进程的写入粒度解耦。
+    wait_s=$interval
+    # 渐入进行中（ramp_from >= 0）：保持 1 秒节拍，尽快走完这段
+    if [ "$ramp_from" -ge 0 ] 2>/dev/null; then
+        wait_s=1
+    fi
+    is_uint "$wait_s" || wait_s=1
+    [ "$wait_s" -lt 1 ] && wait_s=1
+    if [ "$wait_s" -gt 1 ]; then
+        # 分段 sleep：页面保存时写 /tmp/fancontrol_reload，可提前唤醒，最多 1 秒内生效
+        _i=0
+        while [ "$_i" -lt "$wait_s" ]; do
+            sleep 1
+            _i=$(( _i + 1 ))
+            if [ -e /tmp/fancontrol_reload ]; then
+                rm -f /tmp/fancontrol_reload
+                break
+            fi
+        done
+    else
+        sleep 1
+        if [ -e /tmp/fancontrol_reload ]; then
+            rm -f /tmp/fancontrol_reload
+        fi
+    fi
+done
