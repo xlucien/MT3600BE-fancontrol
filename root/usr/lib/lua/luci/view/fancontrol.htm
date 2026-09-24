@@ -1,12 +1,21 @@
-{#
- luci-app-fancontrol —— ucode 模板
- 页面渲染走 dispatcher 的 template action：runtime.render(path, {})，
- 模板作用域自带 include()/media/resource/dispatcher，但**没有** url()，
- 因此所有地址一律用 dispatcher.build_url() 或写死相对路径。
--#}
-
-{% include('header') %}
-
+<%+header%>
+<%
+local uci = require "luci.model.uci".cursor()
+local defs = {mode="auto", manual_speed=128, auto_temp_low=50, auto_temp_mid=60, auto_temp_high=75,
+              auto_pwm_low=50, auto_pwm_mid=128, auto_pwm_high=255,
+              min_temp=40, max_temp=70, min_speed=50, max_speed=255, interval=1,
+              night_enabled=0, night_start="23:00", night_end="07:00", night_speed=0, ramp_up=30,
+              guard_enabled=1, guard_temp=90, guard_exit=80, guard_speed=178}
+local jarr = {}
+for k, d in pairs(defs) do
+    local v = uci:get("fancontrol", "main", k)
+    if type(d) == "string" then
+        jarr[#jarr+1] = string.format('%s:%q', k, v or d)
+    else
+        jarr[#jarr+1] = k .. ':' .. tostring(tonumber(v) or d)
+    end
+end
+%>
 <style>
     #fc { --bg:#f4f6f9; --card:#ffffff; --line:#e8ecf2; --text:#1c2333; --muted:#8a94a6;
           --brand:#2e7bf0; --brand-soft:#eaf2ff; --ok:#22a45d; --ok-soft:#e8f7ee;
@@ -21,7 +30,6 @@
        带 !important 且会命中面板内所有按键/输入框，压过了我们自己的 border:0。
        这里用更高优先级的同款 !important 压回去；需要保留描边的 .btn 在下面单独恢复。 */
     #fc button, #fc input, #fc select, #fc textarea { border:0 !important; outline:0; }
-
     #fc .wrap { max-width:1120px; margin:0 auto; }
 
     #fc .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
@@ -518,16 +526,9 @@
 </div>
 
 <script>
-// 首屏默认值。真实配置由 fetch(dataUrl) 拿到的 config 经 mergeConfig() 覆盖，
-// 这里只是避免首屏空白 —— 因此不依赖服务端模板注入（uci.get/join/url 在
-// ucode 的 template 渲染里拿不到完整作用域，会导致 500）。
-var INIT = {mode:'auto', manual_speed:128, auto_temp_low:50, auto_temp_mid:60, auto_temp_high:75,
-            auto_pwm_low:50, auto_pwm_mid:128, auto_pwm_high:255,
-            min_temp:40, max_temp:70, min_speed:50, max_speed:255, interval:1,
-            night_enabled:0, night_start:'23:00', night_end:'07:00', night_speed:0, ramp_up:30,
-            guard_enabled:1, guard_temp:90, guard_exit:80, guard_speed:178, temp_smooth:5};
-var dataUrl = '{{ dispatcher.build_url("admin", "system", "fancontrol", "data") }}';
-var saveUrl = '{{ dispatcher.build_url("admin", "system", "fancontrol", "save") }}';
+var INIT = { <%= table.concat(jarr, ",") %> };
+var dataUrl = '<%= url("admin/system/fancontrol/data") %>';
+var saveUrl = '<%= url("admin/system/fancontrol/save") %>';
 // 【两级刷新率】慢档完全跟随固件的 interval 配置，不再硬钳下限。
 // 这里曾经写 Math.max(3, ...)，把间隔钳到最低 3 秒，结果即使固件 interval
 // 配成 1 秒，页面依然 3 秒才更新一次，渐入只剩一两帧。
@@ -1516,6 +1517,4 @@ window.addEventListener('resize', drawChart);
 var _origUpdate = updateStatus;
 updateStatus = function(now, svc){ lastTemp = now.temp || 0; _origUpdate(now, svc); };
 </script>
-
-{% include('footer') %}
-
+<%+footer%>
