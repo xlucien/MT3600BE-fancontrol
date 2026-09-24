@@ -3,7 +3,7 @@
 		"title": "风扇控制",
 		"order": 60,
 		"action": {
-			"type": "view",
+			"type": "template",
 			"path": "fancontrol"
 		}
 	},
