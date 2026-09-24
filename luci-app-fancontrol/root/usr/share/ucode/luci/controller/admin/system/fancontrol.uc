@@ -367,14 +367,23 @@ function action_save() {
 	}
 }
 
-// 路由由 /usr/share/luci/menu.d/luci-app-fancontrol.json 声明（ucode LuCI 机制），
-// 不再用 Lua 的 entry() 注册：
-//   admin/system/fancontrol       -> view: fancontrol.ut
-//   admin/system/fancontrol/data  -> function: action_data
-//   admin/system/fancontrol/save  -> function: action_save (POST)
-// controller 路径 controller/admin/system/fancontrol.uc 对应 module
-// "luci.controller.admin.system.fancontrol"。
+// 渲染首页模板。
+// 【坑】菜单里不能用 "type":"template" —— dispatcher 那边传的 scope 是空 {}，
+// 而 header.ut / footer.ut 需要 theme、resource、media、ctx、config 等变量，
+// 空 scope 会让 include(`themes/${theme}/header`) 抛
+// "left-hand side is not a function"。
+// 改用 "type":"function" 走 render_action，dispatcher 会把 runtime.env
+// （含全部模板全局）作为第一个参数传进来，scope 才完整。
+function action_index(env) {
+	// 【坑】模板渲染的 include 由 runtime 注入到 env 上：
+	// runtime.uc:183 `self.env.include = (...args) => self.render_any(...args)`
+	// 必须用 env.include；ucode 另有一个内置的全局 include（模块导入用），
+	// 直接写 include(...) 会命中它并抛 "left-hand side is not a function"。
+	env.include('fancontrol');
+}
+
 return {
+	action_index: action_index,
 	action_data: action_data,
 	action_save: action_save
 };
