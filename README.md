@@ -83,9 +83,10 @@ rm -f /tmp/luci-modulecache/* /tmp/luci-indexcache
 
 ### 方式二：编译 ipk
 
-把 `luci-app-fancontrol/` 放进 OpenWrt/ImmortalWrt SDK 的 `package/` 目录：
+把**本仓库整个目录**放进 OpenWrt/ImmortalWrt SDK 的 `package/` 目录（目录名随意，建议保持 `luci-app-fancontrol`）：
 
 ```sh
+git clone https://github.com/xlucien/gl-mt3600be-fan-control.git package/luci-app-fancontrol
 make package/luci-app-fancontrol/compile V=s
 ```
 
@@ -184,20 +185,23 @@ make package/luci-app-fancontrol/compile V=s
 ## 目录结构
 
 ```
-luci-app-fancontrol/
-├── Makefile
-└── root/
-    ├── etc/
-    │   ├── config/fancontrol          # 默认配置
-    │   └── init.d/fancontrol          # procd 启动脚本（带 respawn）
-    └── usr/
-        ├── libexec/fancontrol-loop         # 守护进程（POSIX sh）
-        └── share/
-            ├── luci/menu.d/luci-app-fancontrol.json          # 路由声明（template + 两个 function）
-            └── ucode/luci/
-                ├── controller/admin/system/fancontrol.uc     # 控制器：data / save 接口
-                └── template/fancontrol.ut                    # 页面（ucode 模板，含 LuCI 主题外壳）
+仓库根目录 = 软件包目录
+├── Makefile                                                 # 包定义（PKG_VERSION 3.18）
+├── root/
+│   ├── etc/
+│   │   ├── config/fancontrol          # 默认配置
+│   │   └── init.d/fancontrol          # procd 启动脚本（带 respawn）
+│   └── usr/
+│       ├── libexec/fancontrol-loop         # 守护进程（POSIX sh）
+│       └── share/
+│           ├── luci/menu.d/luci-app-fancontrol.json          # 路由声明（template + 两个 function）
+│           └── ucode/luci/
+│               ├── controller/admin/system/fancontrol.uc     # 控制器：data / save 接口
+│               └── template/fancontrol.ut                    # 页面（ucode 模板，含 LuCI 主题外壳）
+└── screenshots/                        # README 用的两张截图
 ```
+
+> 早期版本源码放在 `luci-app-fancontrol/` 子目录里（与顶层重复），现已统一——仓库根就是包根。
 
 > 只支持带 ucode 的 LuCI（LuCI 23.x+ / ImmortalWrt 24.10+）。不再附带 Lua 版控制器与视图。
 
