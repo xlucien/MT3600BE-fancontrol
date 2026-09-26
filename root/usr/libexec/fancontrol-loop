@@ -326,12 +326,13 @@ pwm_enable_uci=$(get_config pwm_enable "")
 interval=$(get_config interval 1)
 mode=$(get_config mode auto)
 manual_speed=$(get_config manual_speed 128)
-auto_temp_low=$(get_config auto_temp_low 50)
-auto_temp_mid=$(get_config auto_temp_mid 60)
-auto_temp_high=$(get_config auto_temp_high 75)
-auto_pwm_low=$(get_config auto_pwm_low 50)
+auto_temp_low=$(get_config auto_temp_low 70)
+auto_temp_mid=$(get_config auto_temp_mid 80)
+auto_temp_high=$(get_config auto_temp_high 90)
+auto_pwm_low=$(get_config auto_pwm_low 51)
 auto_pwm_mid=$(get_config auto_pwm_mid 128)
-auto_pwm_high=$(get_config auto_pwm_high 255)
+auto_pwm_high=$(get_config auto_pwm_high 204)
+auto_hyst=$(get_config auto_hyst 3)
 min_temp=$(get_config min_temp 40)
 max_temp=$(get_config max_temp 70)
 min_speed=$(get_config min_speed 50)
@@ -393,12 +394,13 @@ while true; do
     if [ "$cfg_dirty" = "1" ]; then
         mode=$(get_config mode auto)
         manual_speed=$(get_config manual_speed 128)
-        auto_temp_low=$(get_config auto_temp_low 50)
-        auto_temp_mid=$(get_config auto_temp_mid 60)
-        auto_temp_high=$(get_config auto_temp_high 75)
-        auto_pwm_low=$(get_config auto_pwm_low 50)
+        auto_temp_low=$(get_config auto_temp_low 70)
+        auto_temp_mid=$(get_config auto_temp_mid 80)
+        auto_temp_high=$(get_config auto_temp_high 90)
+        auto_pwm_low=$(get_config auto_pwm_low 51)
         auto_pwm_mid=$(get_config auto_pwm_mid 128)
-        auto_pwm_high=$(get_config auto_pwm_high 255)
+        auto_pwm_high=$(get_config auto_pwm_high 204)
+        auto_hyst=$(get_config auto_hyst 3)
         min_temp=$(get_config min_temp 40)
         max_temp=$(get_config max_temp 70)
         min_speed=$(get_config min_speed 50)
@@ -510,22 +512,40 @@ while true; do
             set_system_control
             ;;
         auto)
-            # 自动温控：低温以下停转，低温~中温低速，中温~高温中速，高温以上高速
-            speed=$(awk -v t="$control_temp_c" \
+            # 自动温控：起转温度以下停转，起转~中温低速，中温~高温中速，高温以上高速
+            #
+            # 【起转回差】
+            # 只在「起转 / 停转」这一档做回差。因为这一档的切换是 0 ↔ 起转 PWM，
+            # 而 0 意味着风扇完全停转 —— 温度在阈值附近抖动时就会变成
+            # 「转一会儿 → 降温 → 停 → 升温 → 又转」的循环，是三档里唯一有听感问题的。
+            # 中温 / 全速两档只是升降档（风扇一直在转），抖动不构成启停循环，不做回差。
+            #
+            # 回差不额外引入状态位，直接用「当前输出转速 > 0」当作「已经起转」：
+            # cur_speed 本来就跨轮保持且会落盘，daemon 重启后判据依然正确。
+            #     已经转着 → 温度降到 (起转温度 − 回差) 才停
+            #     还没起转 → 温度升到 起转温度 才转
+            # auto_hyst = 0 时两式相同，等价于无回差（旧行为）。
+            speed=$(awk -v t="$control_temp_c" -v cur="$cur_speed" \
                          -v low="$auto_temp_low" -v mid="$auto_temp_mid" -v high="$auto_temp_high" \
+                         -v hyst="$auto_hyst" \
                          -v pwm_low="$auto_pwm_low" -v pwm_mid="$auto_pwm_mid" -v pwm_high="$auto_pwm_high" \
                 'BEGIN{
-                    if (t+0 < low+0) {
+                    # 回差值非法/为空一律按 0 处理（控制器侧已做范围校验，这里是兜底）
+                    h = (hyst+0 > 0) ? hyst+0 : 0
+                    stop = (cur+0 > 0) ? low+0 - h : low+0
+                    if (t+0 < stop) {
                         print 0;
                     } else if (t+0 < mid+0) {
-                        print pwm_low;
+                        print pwm_low + 0;
                     } else if (t+0 < high+0) {
-                        print pwm_mid;
+                        print pwm_mid + 0;
                     } else {
-                        print pwm_high;
+                        print pwm_high + 0;
                     }
                 }')
-            [ -z "$speed" ] && speed=0
+            # awk 拿到非数字档位值时会原样打印出来（例如uci被手改成 "abc"），
+            # 后面的整数比较会直接报错，这里先夹回 0。
+            is_uint "$speed" || speed=0
             [ "$speed" -lt 0 ] && speed=0
             [ "$speed" -gt 255 ] && speed=255
             target_speed=$speed
@@ -588,19 +608,40 @@ while true; do
             guard_active=0
         fi
 
+        # 先把两个转速夹成合法整数：下面的 [ -lt ] / [ -gt ] 要求整数，
+        # 空值或非数字会直接报 "integer expression expected"，让整轮计算全部失效。
+        # guard_speed 非法退到满速 255：守护的本意是「过热时强制散热」，
+        # 宁可吵也不能停（守护触发了风扇反而不转，是最危险的失效方向）。
+        # night_speed 非法退到 0：夜间本意是安静。
+        is_uint "$guard_speed" || guard_speed=255
+        is_uint "$night_speed" || night_speed=0
+
         if [ "$guard_active" = "1" ]; then
-            speed=$guard_speed
-            # guard_speed 若被配成空值/非数字（手改配置文件、写入失败等），
-            # 直接用会让下面 [ "$speed" -lt 0 ] 报 "integer expression expected"，
-            # 且写 PWM 会失败 —— 守护触发了风扇反而不转，是最危险的失效方向。
-            # 退到满速 255：守护的本意是「过热时强制散热」，宁可吵也不能停。
-            is_uint "$speed" || speed=255
-            reason=guard
+            # 【守护是「下限」，不是「覆盖」】
+            # 旧实现是无条件 speed=guard_speed，这在常规档位本来就要更高转速时会**帮倒忙**：
+            # 典型场景 —— auto 档配成「90℃ → 80%(204)」，而守护是「90℃ → 70%(178)」，
+            # 温度到 90℃ 时守护把 204 压回 178，用户配的 80% 永远生效不了。
+            # 守护的本意是「过热时转速不得低于某个值」，所以正确语义是取下限：
+            #     最终 = max(常规档位, 守护转速)
+            # 这样守护只在常规档位比它低时兜底（manual 0%、夜间 0%、auto 低温档），
+            # 不会压掉本来就更高的常规档位。
+            if [ "$speed" -lt "$guard_speed" ]; then
+                speed=$guard_speed
+                reason=guard
+            fi
         elif [ "$in_night" = "1" ]; then
-            speed=$night_speed
-            # 夜间转速同理，非法值退到 0（夜间本意是安静，退 0 比乱转更符合预期）
-            is_uint "$speed" || speed=0
-            reason=night
+            # 【夜间是「上限」，不是「固定值」】
+            # 同理：夜间窗口内也不该把「温度已经很高、常规档位要求更高转速」的情况压死。
+            # 旧实现固定用 night_speed，于是夜间 85℃（auto 档要求 50%）风扇照样 0% 停转。
+            # 改成取上限：最终 = min(常规档位, 夜间转速)。温度不高时该停还是停，
+            # 温度真上去了就按常规档位走，夜间只负责「安静时别转太快」。
+            #
+            # 【守护优先于夜间】：走到这个 elif 说明守护没触发；一旦守护触发，
+            # 夜间整体让位（过热时散热优先于静音）。
+            if [ "$speed" -gt "$night_speed" ]; then
+                speed=$night_speed
+                reason=night
+            fi
         fi
 
         [ "$speed" -lt 0 ] && speed=0

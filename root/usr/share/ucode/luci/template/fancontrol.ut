@@ -528,8 +528,9 @@
                 <label class="sw"><input type="checkbox" id="guardEnabled" onchange="onToggle()"><span class="sw-i"></span></label>
             </div>
             <div id="rows-guard"></div>
-            <div class="hint">温度升到<b>守护温度</b>时强制按守护转速散热（优先级最高，可压过夜间模式）；
-                降到<b>退出温度</b>以下后交还给常规/夜间规则。两者之间的温度区间保持原状，避免风扇反复启停。</div>
+            <div class="hint">温度升到<b>守护温度</b>时，转速<b>不低于</b>守护转速（优先级最高，可压过夜间模式）；
+                降到<b>退出温度</b>以下后交还给常规/夜间规则。两者之间的温度区间保持原状，避免风扇反复启停。
+                注意守护是<b>下限</b>：常规档位本来就比守护转速高时，沿用常规档位，不会被压低。</div>
         </div>
     </div>
     </div>
@@ -542,8 +543,8 @@
 // 首屏默认值。真实配置由 fetch(dataUrl) 拿到的 config 经 mergeConfig() 覆盖，
 // 这里只是避免首屏空白 —— 因此不依赖服务端模板注入（uci.get/join/url 在
 // ucode 的 template 渲染里拿不到完整作用域，会导致 500）。
-var INIT = {mode:'auto', manual_speed:128, auto_temp_low:50, auto_temp_mid:60, auto_temp_high:75,
-            auto_pwm_low:50, auto_pwm_mid:128, auto_pwm_high:255,
+var INIT = {mode:'auto', manual_speed:128, auto_temp_low:70, auto_temp_mid:80, auto_temp_high:90,
+            auto_pwm_low:51, auto_pwm_mid:128, auto_pwm_high:204, auto_hyst:3,
             min_temp:40, max_temp:70, min_speed:50, max_speed:255, interval:1,
             night_enabled:0, night_start:'23:00', night_end:'07:00', night_speed:0, ramp_up:30,
             guard_enabled:1, guard_temp:90, guard_exit:80, guard_speed:178, temp_smooth:5};
@@ -595,6 +596,9 @@ var SAVED = Object.assign({}, INIT);
 var historyData = [];
 var firstLoad = true;
 var lastTemp = 0;
+// 最近一次采集到的实际 PWM（raw 0-255）。自动挡的起转回差以「当前是否在转」为判据，
+// 这个判据必须和实际输出一致，所以用服务端给的 pwm 而不是本地推算值。
+var lastPwm = 0;
 var lastClock = '';
 // 本次渐入的起点 raw 值：进入渐入时记录，用于算进度条百分比；渐入结束后清空
 var rampFrom = null;
@@ -635,10 +639,11 @@ var ROWS = {
     auto: [
         {k:'auto_temp_low',  lb:'起转温度', sub:'低于此温度停转', unit:' ℃', step:1, lo:20, hi:100},
         {k:'auto_temp_mid',  lb:'中温阈值', sub:'达到后切中速',   unit:' ℃', step:1, lo:20, hi:110},
-        {k:'auto_temp_high', lb:'全速温度', sub:'达到后全速散热', unit:' ℃', step:1, lo:30, hi:120},
-        {k:'auto_pwm_low',  lb:'起转 PWM', sub:'低温区间占空比', pct:1, step:5, lo:0, hi:100},
-        {k:'auto_pwm_mid',  lb:'中速 PWM', sub:'中温区间占空比', pct:1, step:5, lo:0, hi:100},
-        {k:'auto_pwm_high', lb:'全速 PWM', sub:'高温区间占空比', pct:1, step:5, lo:0, hi:100}
+        {k:'auto_temp_high', lb:'高温温度', sub:'达到后切高速',   unit:' ℃', step:1, lo:30, hi:120},
+        {k:'auto_hyst',      lb:'起转回差', sub:'起转后要低于「起转温度 − 回差」才停转；0 = 到点即停', unit:' ℃', step:1, lo:0, hi:20},
+        {k:'auto_pwm_low',  lb:'起转 PWM', sub:'起转~中温区间占空比', pct:1, step:5, lo:0, hi:100},
+        {k:'auto_pwm_mid',  lb:'中速 PWM', sub:'中温~高温区间占空比', pct:1, step:5, lo:0, hi:100},
+        {k:'auto_pwm_high', lb:'高速 PWM', sub:'高温以上占空比', pct:1, step:5, lo:0, hi:100}
     ],
     curve: [
         {k:'min_temp',   lb:'起始温度', sub:'低于此温度保持起始 PWM', unit:' ℃', step:1, lo:20, hi:100},
@@ -647,13 +652,13 @@ var ROWS = {
         {k:'max_speed',  lb:'满速 PWM', sub:'满速温度时的占空比', pct:1, step:5, lo:0, hi:100}
     ],
     night: [
-        {k:'night_speed', lb:'夜间转速', sub:'0% 停转，建议 20~30%', pct:1, step:5, lo:0, hi:50},
+        {k:'night_speed', lb:'夜间转速', sub:'夜间的转速上限；常规档位更低时按常规档位走。0% = 温度不高就停转', pct:1, step:5, lo:0, hi:100},
         {k:'ramp_up',     lb:'渐入时长', sub:'改动后变化的最长时间', unit:' 秒', step:5, lo:0, hi:120}
     ],
     guard: [
         {k:'guard_temp',  lb:'守护温度', sub:'升到此处强制散热', unit:' ℃', step:1, lo:30, hi:120},
         {k:'guard_exit',  lb:'退出温度', sub:'降到此处交还常规；必须低于守护温度，否则会被自动下调到「守护温度 − 1」', unit:' ℃', step:1, lo:20, hi:120},
-        {k:'guard_speed', lb:'守护转速', sub:'守护期间的强制占空比', pct:1, step:5, lo:0, hi:100}
+        {k:'guard_speed', lb:'守护转速', sub:'守护期间的转速下限；常规档位本来就更高时沿用常规档位', pct:1, step:5, lo:0, hi:100}
     ]
 };
 var HOSTS = {auto:'panel-auto', curve:'panel-curve', night:'rows-night', guard:'rows-guard'};
@@ -963,16 +968,48 @@ function previewPending(dirty){
     jpText.textContent = '保存后 ' + label + '渐入 ' + cur + '% → ' + target + '%';
 }
 
-/* 依据当前温度与 auto 挡位阈值，推算目标 PWM 百分比 */
+/* 依据当前温度与 auto 挡位阈值，推算目标 PWM 百分比。
+   必须与 fancontrol-loop 的 auto 分支同构，否则页面预告的「保存后会渐入到 x%」
+   会和守护进程实际做的事对不上。三处要点：
+     ① 起转回差：已经转着（lastPwm > 0）时要降到「起转温度 − 回差」才停
+     ② 温度守护取下限：max(档位, 守护转速)
+     ③ 夜间取上限：min(档位, 夜间转速)；守护触发时夜间让位 */
 function currentAutoPct(){
     var t = lastTemp;
     if(!t) return null;
     var f = function(k, d){ var v = parseInt(CFG[k], 10); return isNaN(v) ? d : v; };
-    var lo = f('auto_temp_low', 50), mid = f('auto_temp_mid', 60), hi = f('auto_temp_high', 75);
-    if(t < lo) return 0;
-    if(t < mid) return raw2pct(f('auto_pwm_low', 50));
-    if(t < hi) return raw2pct(f('auto_pwm_mid', 128));
-    return raw2pct(f('auto_pwm_high', 255));
+    var lo = f('auto_temp_low', 70), mid = f('auto_temp_mid', 80), hi = f('auto_temp_high', 90);
+    var hyst = f('auto_hyst', 3);
+    if(hyst < 0) hyst = 0;
+    var stop = (lastPwm > 0) ? (lo - hyst) : lo;
+
+    var raw;
+    if(t < stop) raw = 0;
+    else if(t < mid) raw = f('auto_pwm_low', 51);
+    else if(t < hi) raw = f('auto_pwm_mid', 128);
+    else raw = f('auto_pwm_high', 204);
+    return raw2pct(applyOverrides(raw, t));
+}
+
+/* 把「温度守护（下限）」和「夜间静音（上限）」叠到常规档位算出的 raw 值上。
+   与 fancontrol-loop 里的那一段一一对应。 */
+function applyOverrides(raw, t){
+    var f = function(k, d){ var v = parseInt(CFG[k], 10); return isNaN(v) ? d : v; };
+    var guardOn = (f('guard_enabled', 1) === 1) && (f('guard_temp', 90) > 0) && (t >= f('guard_temp', 90));
+    var gSpeed = f('guard_speed', 178), nSpeed = f('night_speed', 0);
+    if(guardOn){
+        if(raw < gSpeed) raw = gSpeed;      // 守护是下限，只兜底不压制
+        return raw;                          // 守护触发时夜间整体让位
+    }
+    if(f('night_enabled', 0) === 1){
+        // 用路由器自己的时钟判断（与守护进程一致），浏览器时区/时间不对也不会算错
+        var clk = lastClock ||
+                  ('0' + new Date().getHours()).slice(-2) + ':' + ('0' + new Date().getMinutes()).slice(-2);
+        if(inNight(clk)){
+            if(raw > nSpeed) raw = nSpeed;  // 夜间是上限，只压高不抬低
+        }
+    }
+    return raw;
 }
 
 /* 依据当前温度与线性曲线参数，推算目标 PWM 百分比 */
@@ -1002,7 +1039,7 @@ function doSave(){
         toast('注意：自动挡位阈值应满足 起转 < 中温 < 全速');
     }
     var KEYS = ['mode','manual_speed',
-                'auto_temp_low','auto_temp_mid','auto_temp_high',
+                'auto_temp_low','auto_temp_mid','auto_temp_high','auto_hyst',
                 'auto_pwm_low','auto_pwm_mid','auto_pwm_high',
                 'min_temp','max_temp','min_speed','max_speed',
                 'night_enabled','night_start','night_end','night_speed','ramp_up',
@@ -1313,7 +1350,8 @@ var curveSig = null;      // 上一次画曲线时的参数签名
 function curveSignature(){
     var m = CFG.mode;
     if(m === 'auto') return m + '|' + CFG.auto_temp_low + ',' + CFG.auto_temp_mid + ',' + CFG.auto_temp_high +
-                                     ',' + CFG.auto_pwm_low + ',' + CFG.auto_pwm_mid + ',' + CFG.auto_pwm_high;
+                                     ',' + CFG.auto_pwm_low + ',' + CFG.auto_pwm_mid + ',' + CFG.auto_pwm_high +
+                                     ',' + CFG.auto_hyst;
     if(m === 'auto_curve') return m + '|' + CFG.min_temp + ',' + CFG.max_temp + ',' + CFG.min_speed + ',' + CFG.max_speed;
     if(m === 'manual') return m + '|' + CFG.manual_speed;
     return m;
@@ -1366,6 +1404,14 @@ function drawCurve(){
             grid += '<line x1="' + ML + '" y1="' + y.toFixed(1) + '" x2="' + (W-MR) + '" y2="' + y.toFixed(1) + '" stroke="#eef1f6"/>';
             labels += '<text x="' + (ML-4) + '" y="' + (y+3).toFixed(1) + '" font-size="8.5" fill="#8a94a6" text-anchor="end">' + p + '%</text>';
         });
+        // 起转回差：用一条橙色虚线标出「停转线」。起转后温度要掉到这条线左边才停转，
+        // 否则风扇会在起转温度附近反复启停。回差为 0 时不画（停转线与起转线重合）。
+        if(m === 'auto' && (parseInt(CFG.auto_hyst, 10) || 0) > 0){
+            var stopT = CFG.auto_temp_low - parseInt(CFG.auto_hyst, 10);
+            grid += '<line x1="' + X(stopT).toFixed(1) + '" y1="' + MT + '" x2="' + X(stopT).toFixed(1) +
+                    '" y2="' + (H-MB) + '" stroke="#f59e0b" stroke-width="1" stroke-dasharray="2,2" opacity="0.8"/>';
+            labels += '<text x="' + (X(stopT)+2).toFixed(1) + '" y="' + (MT+8) + '" font-size="7.5" fill="#f59e0b">停转</text>';
+        }
         // 标记放进独立的 <g>，之后每帧只改它的坐标，不再重建整个 SVG
         box.innerHTML =
             '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;display:block">' +
@@ -1539,7 +1585,11 @@ requestAnimationFrame(fanSpin);
 window.addEventListener('resize', drawChart);
 
 var _origUpdate = updateStatus;
-updateStatus = function(now, svc){ lastTemp = now.temp || 0; _origUpdate(now, svc); };
+updateStatus = function(now, svc){
+    lastTemp = now.temp || 0;
+    lastPwm = (now.pwm == null ? 0 : now.pwm) || 0;
+    _origUpdate(now, svc);
+};
 </script>
 
 {% include('footer') %}

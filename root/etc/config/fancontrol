@@ -15,13 +15,18 @@ config fancontrol 'main'
 
 	option manual_speed '128'
 
-	# auto 模式的三档阈值与对应占空比（0-255）
-	option auto_temp_low '50'
-	option auto_temp_mid '60'
-	option auto_temp_high '75'
-	option auto_pwm_low '50'
-	option auto_pwm_mid '128'
-	option auto_pwm_high '255'
+# auto 模式的三档阈值与对应占空比（0-255）
+# 默认：70℃ 以下停转 / 70℃ 起转 20% / 80℃ 50% / 90℃ 80%
+option auto_temp_low '70'
+option auto_temp_mid '80'
+option auto_temp_high '90'
+option auto_pwm_low '51'
+option auto_pwm_mid '128'
+option auto_pwm_high '204'
+
+# 起转回差（℃）。起转后要降到「auto_temp_low − auto_hyst」才停转，
+# 避免温度在起转温度附近抖动时风扇反复启停。0 = 到点即停（无回差）。
+option auto_hyst '3'
 
 	# auto_curve 模式的线性插值端点（0-255）
 	option min_temp '40'
@@ -32,13 +37,15 @@ config fancontrol 'main'
 	# 历史记录保留条数
 	option history_size '60'
 
-	# 夜间模式：窗口内固定用 night_speed，支持跨天（如 23:00 -> 07:00）
+	# 夜间模式：窗口内转速「不超过」night_speed（取上限，不是固定值），支持跨天（如 23:00 -> 07:00）
+# 注：常规档位算出来比 night_speed 还低时按常规档位走（更安静）；温度守护触发时夜间整体让位。
 	option night_enabled '0'
 	option night_start '23:00'
 	option night_end '07:00'
 	option night_speed '0'
 
-	# 温度守护：升到 guard_temp 强制用 guard_speed，降到 guard_exit 才交还常规。
+	# 温度守护：升到 guard_temp 时转速「不低于」guard_speed（取下限），降到 guard_exit 才交还常规。
+# 常规档位本来就比 guard_speed 高时沿用常规档位 —— 守护只兜底，不压制。
 	# guard_exit 必须低于 guard_temp；配置反序时守护进程会自动夹到 guard_temp-1，
 	# 避免温度落在 [guard_temp, guard_exit] 区间时退不出闭锁。
 	option guard_enabled '1'

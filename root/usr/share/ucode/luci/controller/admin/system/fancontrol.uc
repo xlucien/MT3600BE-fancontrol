@@ -150,7 +150,7 @@ function action_data() {
 	let autostart = trim(shell_out('ls /etc/rc.d/S99fancontrol >/dev/null 2>&1 && echo 1 || echo 0'));
 
 	let keys = ['mode','manual_speed','auto_temp_low','auto_temp_mid','auto_temp_high',
-	            'auto_pwm_low','auto_pwm_mid','auto_pwm_high',
+	            'auto_pwm_low','auto_pwm_mid','auto_pwm_high','auto_hyst',
 	            'min_temp','max_temp','min_speed','max_speed','interval',
 	            'night_enabled','night_start','night_end','night_speed',
 	            'guard_enabled','guard_temp','guard_exit','guard_speed','ramp_up',
@@ -221,7 +221,7 @@ function action_save() {
 
 	let seen = [];
 	let seenkeys = ['mode','manual_speed','auto_temp_low','auto_temp_mid','auto_temp_high',
-	                'auto_pwm_low','auto_pwm_mid','auto_pwm_high',
+	                'auto_pwm_low','auto_pwm_mid','auto_pwm_high','auto_hyst',
 	                'min_temp','max_temp','min_speed','max_speed',
 	                'night_enabled','night_start','night_end','night_speed',
 	                'guard_enabled','guard_temp','guard_exit','guard_speed','ramp_up',
@@ -250,12 +250,15 @@ function action_save() {
 
 	let specs = [
 		['manual_speed', 0, 255, 128],
-		['auto_temp_low', 20, 100, 50],
-		['auto_temp_mid', 20, 110, 60],
-		['auto_temp_high', 30, 120, 75],
-		['auto_pwm_low', 0, 255, 50],
+		['auto_temp_low', 20, 100, 70],
+		['auto_temp_mid', 20, 110, 80],
+		['auto_temp_high', 30, 120, 90],
+		['auto_pwm_low', 0, 255, 51],
 		['auto_pwm_mid', 0, 255, 128],
-		['auto_pwm_high', 0, 255, 255],
+		['auto_pwm_high', 0, 255, 204],
+		// 起转回差（℃）：起转后要低于「auto_temp_low − auto_hyst」才停转。
+		// 0 = 无回差（到点即停）。上限 20 是怕回差过大把起转温度整体拖得太低。
+		['auto_hyst', 0, 20, 3],
 		['min_temp', 20, 100, 40],
 		['max_temp', 30, 110, 70],
 		['min_speed', 0, 255, 50],
